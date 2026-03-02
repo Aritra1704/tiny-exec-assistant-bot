@@ -90,11 +90,13 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                 return_value={"type": "text", "text": "Let me think about that."},
             ),
             patch("src.bot.save_message") as save_message_mock,
-            patch("src.bot.get_recent_messages", return_value=history_rows),
+            patch("src.bot.get_recent_messages", return_value=history_rows) as get_recent_messages_mock,
             patch("src.bot.chat", return_value="Here is the concise summary.") as chat_mock,
+            patch("builtins.print") as print_mock,
         ):
             await bot.on_message(update, context)
 
+        get_recent_messages_mock.assert_called_once_with(321, 20)
         chat_mock.assert_called_once()
         messages = chat_mock.call_args.args[0]
         self.assertEqual(messages[0], {"role": "system", "content": SYSTEM_PROMPT})
@@ -112,6 +114,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                 unittest.mock.call(321, "assistant", "Here is the concise summary."),
             ],
         )
+        print_mock.assert_any_call("Loaded 2 previous messages for chat_id 321")
         update.message.reply_text.assert_awaited_once_with("Here is the concise summary.")
 
     @patch("src.bot.asyncio.to_thread", new=_run_inline)

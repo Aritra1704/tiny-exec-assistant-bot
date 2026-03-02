@@ -115,7 +115,7 @@ def save_message(chat_id: int, role: str, content: str) -> int:
     return int(message_id)
 
 
-def get_recent_messages(chat_id: int, limit: int = 20):
+def get_recent_messages(chat_id: int, limit: int = 20) -> list[dict]:
     safe_limit = max(1, min(int(limit), 50))
     q = f"""
     SELECT id, created_at, chat_id, role, content

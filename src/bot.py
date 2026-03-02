@@ -23,7 +23,7 @@ from src.tools.notes import tool_save_note, tool_list_notes
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
-CHAT_HISTORY_LIMIT = max(1, min(int(os.getenv("CHAT_HISTORY_LIMIT", "12")), 20))
+CHAT_HISTORY_LIMIT = 20
 CHAT_CONTEXT_CHAR_LIMIT = max(200, min(int(os.getenv("CHAT_CONTEXT_CHAR_LIMIT", "1200")), 4000))
 DEBUG_TEXT_LIMIT = 80
 
@@ -102,7 +102,9 @@ async def _save_chat_message(chat_id: int, role: str, content: str) -> None:
 
 async def _get_chat_history(chat_id: int) -> list[dict]:
     try:
-        return await asyncio.to_thread(get_recent_messages, chat_id, CHAT_HISTORY_LIMIT)
+        history_rows = await asyncio.to_thread(get_recent_messages, chat_id, CHAT_HISTORY_LIMIT)
+        print(f"Loaded {len(history_rows)} previous messages for chat_id {chat_id}")
+        return history_rows
     except Exception as exc:
         print(f"chat memory load failed: {type(exc).__name__}")
         return []
