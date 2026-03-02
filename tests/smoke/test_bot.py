@@ -22,9 +22,10 @@ class _DummyApplication:
 
 
 class _DummyContext:
-    def __init__(self):
+    def __init__(self, args=None):
         self.bot = SimpleNamespace(send_message=AsyncMock())
         self.application = _DummyApplication()
+        self.args = args or []
 
 
 class _DummyMessage:
@@ -54,29 +55,25 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                     "args": {"text": "buy oat milk"},
                 },
             ),
-            patch(
-                "src.bot._execute_tool",
-                return_value={"ok": True, "note_id": 7, "saved": "buy oat milk"},
-            ) as execute_tool_mock,
+            patch("src.bot._run_tool_and_reply", new=AsyncMock()) as run_tool_mock,
             patch("src.bot.save_message") as save_message_mock,
-            patch("src.bot.log_tool") as log_tool_mock,
         ):
             await bot.on_message(update, context)
 
-        execute_tool_mock.assert_called_once()
+        run_tool_mock.assert_awaited_once_with(
+            update,
+            context,
+            "save_note",
+            {"text": "buy oat milk"},
+            debug_source="tool routing",
+        )
         self.assertEqual(
             save_message_mock.call_args_list,
             [
                 unittest.mock.call(321, "user", "Save a note: buy oat milk"),
-                unittest.mock.call(321, "assistant", "Saved note 7."),
             ],
         )
-        log_tool_mock.assert_called_once_with(
-            tool="save_note",
-            args_json={"text": "buy oat milk"},
-            result_json={"ok": True, "note_id": 7, "saved": "buy oat milk"},
-        )
-        update.message.reply_text.assert_awaited_once_with("Saved note 7.")
+        update.message.reply_text.assert_not_awaited()
 
     @patch("src.bot.asyncio.to_thread", new=_run_inline)
     async def test_on_message_uses_normal_chat_for_non_tool_text(self):
@@ -157,6 +154,75 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(messages[2]["content"]), bot.CHAT_CONTEXT_CHAR_LIMIT)
         self.assertTrue(messages[2]["content"].endswith("..."))
 
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_note_command_runs_save_note_tool(self):
+        update = _DummyUpdate("/note buy oat milk")
+        context = _DummyContext(args=["buy", "oat", "milk"])
+
+        with (
+            patch("src.bot._run_tool_and_reply", new=AsyncMock()) as run_tool_mock,
+            patch("src.bot.save_message") as save_message_mock,
+        ):
+            await bot.note_command(update, context)
+
+        self.assertEqual(
+            save_message_mock.call_args_list,
+            [unittest.mock.call(321, "user", "/note buy oat milk")],
+        )
+        run_tool_mock.assert_awaited_once_with(
+            update,
+            context,
+            "save_note",
+            {"text": "buy oat milk"},
+            debug_source="command /note",
+        )
+
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_notes_command_runs_list_notes_tool(self):
+        update = _DummyUpdate("/notes 5")
+        context = _DummyContext(args=["5"])
+
+        with (
+            patch("src.bot._run_tool_and_reply", new=AsyncMock()) as run_tool_mock,
+            patch("src.bot.save_message") as save_message_mock,
+        ):
+            await bot.notes_command(update, context)
+
+        self.assertEqual(
+            save_message_mock.call_args_list,
+            [unittest.mock.call(321, "user", "/notes 5")],
+        )
+        run_tool_mock.assert_awaited_once_with(
+            update,
+            context,
+            "list_notes",
+            {"limit": 5},
+            debug_source="command /notes",
+        )
+
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_remind_command_runs_set_reminder_tool(self):
+        update = _DummyUpdate("/remind 2 stretch now")
+        context = _DummyContext(args=["2", "stretch", "now"])
+
+        with (
+            patch("src.bot._run_tool_and_reply", new=AsyncMock()) as run_tool_mock,
+            patch("src.bot.save_message") as save_message_mock,
+        ):
+            await bot.remind_command(update, context)
+
+        self.assertEqual(
+            save_message_mock.call_args_list,
+            [unittest.mock.call(321, "user", "/remind 2 stretch now")],
+        )
+        run_tool_mock.assert_awaited_once_with(
+            update,
+            context,
+            "set_reminder",
+            {"in_minutes": 2, "message": "stretch now"},
+            debug_source="command /remind",
+        )
+
 
 class _FakeApp:
     def __init__(self):
@@ -194,5 +260,5 @@ class BotStartupSmokeTests(unittest.TestCase):
 
         init_db_mock.assert_called_once_with()
         self.assertEqual(fake_builder.token_value, "telegram-token")
-        self.assertEqual(len(fake_app.handlers), 1)
+        self.assertEqual(len(fake_app.handlers), 4)
         fake_app.run_polling.assert_called_once()

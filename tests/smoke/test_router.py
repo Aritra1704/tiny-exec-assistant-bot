@@ -10,7 +10,11 @@ class RouterSmokeTests(unittest.TestCase):
 
         self.assertEqual(
             parsed,
-            {"tool": "save_note", "args": {"text": "buy oat milk"}},
+            {
+                "type": "tool",
+                "tool": "save_note",
+                "args": {"text": "buy oat milk"},
+            },
         )
 
     def test_parse_tool_call_extracts_first_json_block(self):
@@ -18,13 +22,17 @@ class RouterSmokeTests(unittest.TestCase):
 
         self.assertEqual(
             parsed,
-            {"tool": "list_notes", "args": {"limit": 3}},
+            {
+                "type": "tool",
+                "tool": "list_notes",
+                "args": {"limit": 3},
+            },
         )
 
     def test_parse_tool_call_rejects_invalid_schema(self):
         parsed = parse_tool_call('{"tool":"save_note"}')
 
-        self.assertIsNone(parsed)
+        self.assertEqual(parsed, {"type": "text", "text": '{"tool":"save_note"}'})
 
     @patch("src.router.chat", return_value='{"tool":"save_note","args":{"text":"  buy oat milk  "}}')
     def test_decide_returns_validated_save_note_tool(self, _chat_mock):

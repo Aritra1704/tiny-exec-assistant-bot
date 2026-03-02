@@ -2,10 +2,17 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import Callable
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from src.llm import chat
 from src.memory.store import get_recent_messages, init_db, log_tool, save_message
@@ -101,6 +108,50 @@ async def _get_chat_history(chat_id: int) -> list[dict]:
         return []
 
 
+def _make_send_telegram(context: ContextTypes.DEFAULT_TYPE) -> Callable[[int, str], None]:
+    loop = asyncio.get_running_loop()
+
+    def send_telegram(target_chat_id: int, text: str) -> None:
+        def _enqueue() -> None:
+            context.application.create_task(
+                context.bot.send_message(chat_id=target_chat_id, text=text)
+            )
+
+        loop.call_soon_threadsafe(_enqueue)
+
+    return send_telegram
+
+
+async def _run_tool_and_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tool: str,
+    args: dict,
+    debug_source: str,
+) -> None:
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    print(f'{debug_source} tool name="{tool}" args={json.dumps(args, sort_keys=True)}')
+    send_telegram = _make_send_telegram(context)
+
+    try:
+        result = await asyncio.to_thread(_execute_tool, tool, args, send_telegram, chat_id)
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)}
+
+    try:
+        await asyncio.to_thread(log_tool, tool=tool, args_json=args, result_json=result)
+        print("tool logged to postgres")
+    except Exception as exc:
+        print(f"log_tool failed for {tool}: {type(exc).__name__}")
+
+    reply = _format_tool_reply(tool, result)
+    await update.message.reply_text(reply)
+    await _save_chat_message(chat_id, "assistant", reply)
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return
@@ -113,40 +164,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(
         f'incoming message chat_id={chat_id} user_text="{_truncate_for_debug(user_text)}"'
     )
-    loop = asyncio.get_running_loop()
     await _save_chat_message(chat_id, "user", user_text)
-
-    # APScheduler runs callbacks in a background thread, so enqueue Telegram sends onto the bot loop.
-    def send_telegram(target_chat_id: int, text: str) -> None:
-        def _enqueue() -> None:
-            context.application.create_task(
-                context.bot.send_message(chat_id=target_chat_id, text=text)
-            )
-
-        loop.call_soon_threadsafe(_enqueue)
 
     decision = await asyncio.to_thread(decide, user_text)
     print(f'router decision type="{decision["type"]}"')
 
     if decision["type"] == "tool":
-        tool = decision["tool"]
-        args = decision["args"]
-        print(f'tool routing name="{tool}" args={json.dumps(args, sort_keys=True)}')
-
-        try:
-            result = await asyncio.to_thread(_execute_tool, tool, args, send_telegram, chat_id)
-        except Exception as exc:
-            result = {"ok": False, "error": str(exc)}
-
-        try:
-            await asyncio.to_thread(log_tool, tool=tool, args_json=args, result_json=result)
-            print("tool logged to postgres")
-        except Exception as exc:
-            print(f"log_tool failed for {tool}: {type(exc).__name__}")
-
-        reply = _format_tool_reply(tool, result)
-        await update.message.reply_text(reply)
-        await _save_chat_message(chat_id, "assistant", reply)
+        await _run_tool_and_reply(
+            update,
+            context,
+            decision["tool"],
+            decision["args"],
+            debug_source="tool routing",
+        )
         return
 
     if _should_use_router_text(decision.get("text", "")):
@@ -160,6 +190,77 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _save_chat_message(chat_id, "assistant", reply)
 
 
+async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f'command /note chat_id={chat_id} user_text="{_truncate_for_debug(user_text)}"')
+    await _save_chat_message(chat_id, "user", user_text)
+
+    text = " ".join(context.args).strip()
+    args = {"text": text}
+    await _run_tool_and_reply(update, context, "save_note", args, debug_source="command /note")
+
+
+async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f'command /notes chat_id={chat_id} user_text="{_truncate_for_debug(user_text)}"')
+    await _save_chat_message(chat_id, "user", user_text)
+
+    raw_limit = context.args[0] if context.args else "10"
+    try:
+        limit = int(raw_limit)
+    except ValueError:
+        reply = "Use /notes or /notes <limit>."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        return
+
+    args = {"limit": limit}
+    await _run_tool_and_reply(update, context, "list_notes", args, debug_source="command /notes")
+
+
+async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f'command /remind chat_id={chat_id} user_text="{_truncate_for_debug(user_text)}"')
+    await _save_chat_message(chat_id, "user", user_text)
+
+    if len(context.args) < 2:
+        reply = "Use /remind <minutes> <message>."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        return
+
+    raw_minutes = context.args[0]
+    message = " ".join(context.args[1:]).strip()
+    try:
+        minutes = int(raw_minutes)
+    except ValueError:
+        reply = "Use /remind <minutes> <message>."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        return
+
+    args = {"in_minutes": minutes, "message": message}
+    await _run_tool_and_reply(
+        update,
+        context,
+        "set_reminder",
+        args,
+        debug_source="command /remind",
+    )
+
+
 def main():
     init_db()
 
@@ -168,6 +269,9 @@ def main():
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in .env")
 
     app = ApplicationBuilder().token(token).build()
+    app.add_handler(CommandHandler("note", note_command))
+    app.add_handler(CommandHandler("notes", notes_command))
+    app.add_handler(CommandHandler("remind", remind_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
