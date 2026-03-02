@@ -160,22 +160,22 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         context = _DummyContext(args=["buy", "oat", "milk"])
 
         with (
-            patch("src.bot._run_tool_and_reply", new=AsyncMock()) as run_tool_mock,
+            patch("src.bot._run_tool", new=AsyncMock(return_value={"ok": True, "note_id": 7})) as run_tool_mock,
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
             patch("src.bot.save_message") as save_message_mock,
         ):
             await bot.note_command(update, context)
 
         self.assertEqual(
             save_message_mock.call_args_list,
-            [unittest.mock.call(321, "user", "/note buy oat milk")],
+            [
+                unittest.mock.call(321, "user", "/note buy oat milk"),
+                unittest.mock.call(321, "assistant", "Noted (ID 7)."),
+            ],
         )
-        run_tool_mock.assert_awaited_once_with(
-            update,
-            context,
-            "save_note",
-            {"text": "buy oat milk"},
-            debug_source="command /note",
-        )
+        run_tool_mock.assert_awaited_once_with("save_note", {"text": "buy oat milk"}, context, 321)
+        log_tool_mock.assert_awaited_once_with("save_note", {"text": "buy oat milk"}, {"ok": True, "note_id": 7})
+        update.message.reply_text.assert_awaited_once_with("Noted (ID 7).")
 
     @patch("src.bot.asyncio.to_thread", new=_run_inline)
     async def test_notes_command_runs_list_notes_tool(self):
@@ -183,21 +183,34 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         context = _DummyContext(args=["5"])
 
         with (
-            patch("src.bot._run_tool_and_reply", new=AsyncMock()) as run_tool_mock,
+            patch(
+                "src.bot._run_tool",
+                new=AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "notes": [
+                            {"id": 9, "text": "buy oat milk"},
+                            {"id": 8, "text": "call the bank"},
+                        ],
+                    }
+                ),
+            ) as run_tool_mock,
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
             patch("src.bot.save_message") as save_message_mock,
         ):
             await bot.notes_command(update, context)
 
         self.assertEqual(
             save_message_mock.call_args_list,
-            [unittest.mock.call(321, "user", "/notes 5")],
+            [
+                unittest.mock.call(321, "user", "/notes 5"),
+                unittest.mock.call(321, "assistant", "9: buy oat milk\n8: call the bank"),
+            ],
         )
-        run_tool_mock.assert_awaited_once_with(
-            update,
-            context,
-            "list_notes",
-            {"limit": 5},
-            debug_source="command /notes",
+        run_tool_mock.assert_awaited_once_with("list_notes", {"limit": 5}, context, 321)
+        log_tool_mock.assert_awaited_once()
+        update.message.reply_text.assert_awaited_once_with(
+            "9: buy oat milk\n8: call the bank"
         )
 
     @patch("src.bot.asyncio.to_thread", new=_run_inline)
@@ -206,21 +219,35 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         context = _DummyContext(args=["2", "stretch", "now"])
 
         with (
-            patch("src.bot._run_tool_and_reply", new=AsyncMock()) as run_tool_mock,
+            patch(
+                "src.bot._run_tool",
+                new=AsyncMock(
+                    return_value={"ok": True, "run_at": "2026-03-02T10:15:00+00:00"}
+                ),
+            ) as run_tool_mock,
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
             patch("src.bot.save_message") as save_message_mock,
         ):
             await bot.remind_command(update, context)
 
         self.assertEqual(
             save_message_mock.call_args_list,
-            [unittest.mock.call(321, "user", "/remind 2 stretch now")],
+            [
+                unittest.mock.call(321, "user", "/remind 2 stretch now"),
+                unittest.mock.call(
+                    321, "assistant", "Done. I'll remind you at 2026-03-02T10:15:00+00:00."
+                ),
+            ],
         )
         run_tool_mock.assert_awaited_once_with(
-            update,
-            context,
             "set_reminder",
             {"in_minutes": 2, "message": "stretch now"},
-            debug_source="command /remind",
+            context,
+            321,
+        )
+        log_tool_mock.assert_awaited_once()
+        update.message.reply_text.assert_awaited_once_with(
+            "Done. I'll remind you at 2026-03-02T10:15:00+00:00."
         )
 
 

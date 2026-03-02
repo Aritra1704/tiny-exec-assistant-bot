@@ -122,6 +122,38 @@ def _make_send_telegram(context: ContextTypes.DEFAULT_TYPE) -> Callable[[int, st
     return send_telegram
 
 
+async def _run_tool(tool: str, args: dict, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> dict:
+    send_telegram = _make_send_telegram(context)
+    try:
+        return await asyncio.to_thread(_execute_tool, tool, args, send_telegram, chat_id)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+async def _log_tool_result(tool: str, args: dict, result: dict) -> None:
+    try:
+        await asyncio.to_thread(log_tool, tool=tool, args_json=args, result_json=result)
+        print("tool logged to postgres")
+    except Exception as exc:
+        print(f"log_tool failed for {tool}: {type(exc).__name__}")
+
+
+def _format_command_reply(tool: str, result: dict) -> str:
+    if not result.get("ok"):
+        return f"Couldn’t complete that: {result.get('error', 'unknown error')}"
+
+    if tool == "save_note":
+        return f"Noted (ID {result['note_id']})."
+    if tool == "list_notes":
+        notes = result.get("notes", [])
+        if not notes:
+            return "No notes yet."
+        return "\n".join(f"{note['id']}: {note['text']}" for note in notes)
+    if tool == "set_reminder":
+        return f"Done. I'll remind you at {result['run_at']}."
+    return "Done."
+
+
 async def _run_tool_and_reply(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -134,18 +166,8 @@ async def _run_tool_and_reply(
 
     chat_id = update.effective_chat.id
     print(f'{debug_source} tool name="{tool}" args={json.dumps(args, sort_keys=True)}')
-    send_telegram = _make_send_telegram(context)
-
-    try:
-        result = await asyncio.to_thread(_execute_tool, tool, args, send_telegram, chat_id)
-    except Exception as exc:
-        result = {"ok": False, "error": str(exc)}
-
-    try:
-        await asyncio.to_thread(log_tool, tool=tool, args_json=args, result_json=result)
-        print("tool logged to postgres")
-    except Exception as exc:
-        print(f"log_tool failed for {tool}: {type(exc).__name__}")
+    result = await _run_tool(tool, args, context, chat_id)
+    await _log_tool_result(tool, args, result)
 
     reply = _format_tool_reply(tool, result)
     await update.message.reply_text(reply)
@@ -196,12 +218,16 @@ async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     user_text = (update.message.text or "").strip()
-    print(f'command /note chat_id={chat_id} user_text="{_truncate_for_debug(user_text)}"')
+    print(f"CMD /note args={json.dumps(context.args)}")
     await _save_chat_message(chat_id, "user", user_text)
 
     text = " ".join(context.args).strip()
     args = {"text": text}
-    await _run_tool_and_reply(update, context, "save_note", args, debug_source="command /note")
+    result = await _run_tool("save_note", args, context, chat_id)
+    await _log_tool_result("save_note", args, result)
+    reply = _format_command_reply("save_note", result)
+    await update.message.reply_text(reply)
+    await _save_chat_message(chat_id, "assistant", reply)
 
 
 async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,7 +236,7 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     user_text = (update.message.text or "").strip()
-    print(f'command /notes chat_id={chat_id} user_text="{_truncate_for_debug(user_text)}"')
+    print(f"CMD /notes args={json.dumps(context.args)}")
     await _save_chat_message(chat_id, "user", user_text)
 
     raw_limit = context.args[0] if context.args else "10"
@@ -223,7 +249,11 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = {"limit": limit}
-    await _run_tool_and_reply(update, context, "list_notes", args, debug_source="command /notes")
+    result = await _run_tool("list_notes", args, context, chat_id)
+    await _log_tool_result("list_notes", args, result)
+    reply = _format_command_reply("list_notes", result)
+    await update.message.reply_text(reply)
+    await _save_chat_message(chat_id, "assistant", reply)
 
 
 async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,7 +262,7 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     user_text = (update.message.text or "").strip()
-    print(f'command /remind chat_id={chat_id} user_text="{_truncate_for_debug(user_text)}"')
+    print(f"CMD /remind args={json.dumps(context.args)}")
     await _save_chat_message(chat_id, "user", user_text)
 
     if len(context.args) < 2:
@@ -252,13 +282,11 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = {"in_minutes": minutes, "message": message}
-    await _run_tool_and_reply(
-        update,
-        context,
-        "set_reminder",
-        args,
-        debug_source="command /remind",
-    )
+    result = await _run_tool("set_reminder", args, context, chat_id)
+    await _log_tool_result("set_reminder", args, result)
+    reply = _format_command_reply("set_reminder", result)
+    await update.message.reply_text(reply)
+    await _save_chat_message(chat_id, "assistant", reply)
 
 
 def main():
