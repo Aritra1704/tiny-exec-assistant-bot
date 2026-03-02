@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -17,6 +18,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 CHAT_HISTORY_LIMIT = max(1, min(int(os.getenv("CHAT_HISTORY_LIMIT", "12")), 20))
 CHAT_CONTEXT_CHAR_LIMIT = max(200, min(int(os.getenv("CHAT_CONTEXT_CHAR_LIMIT", "1200")), 4000))
+DEBUG_TEXT_LIMIT = 80
 
 
 def _execute_tool(tool: str, args: dict, send_fn, chat_id: int) -> dict:
@@ -54,6 +56,13 @@ def _format_tool_reply(tool: str, result: dict) -> str:
 def _should_use_router_text(router_text: str) -> bool:
     stripped = router_text.strip()
     return bool(stripped) and stripped.endswith("?")
+
+
+def _truncate_for_debug(text: str, limit: int = DEBUG_TEXT_LIMIT) -> str:
+    cleaned_text = text.strip()
+    if len(cleaned_text) <= limit:
+        return cleaned_text
+    return cleaned_text[: limit - 3].rstrip() + "..."
 
 
 def _trim_content_for_context(content: str) -> str:
@@ -101,6 +110,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+    print(
+        f'incoming message chat_id={chat_id} user_text="{_truncate_for_debug(user_text)}"'
+    )
     loop = asyncio.get_running_loop()
     await _save_chat_message(chat_id, "user", user_text)
 
@@ -114,11 +126,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop.call_soon_threadsafe(_enqueue)
 
     decision = await asyncio.to_thread(decide, user_text)
+    print(f'router decision type="{decision["type"]}"')
 
     if decision["type"] == "tool":
         tool = decision["tool"]
         args = decision["args"]
-        print(f"tool decision detected: {tool}")
+        print(f'tool routing name="{tool}" args={json.dumps(args, sort_keys=True)}')
 
         try:
             result = await asyncio.to_thread(_execute_tool, tool, args, send_telegram, chat_id)
@@ -127,7 +140,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             await asyncio.to_thread(log_tool, tool=tool, args_json=args, result_json=result)
-            print(f"log_tool succeeded: {tool}")
+            print("tool logged to postgres")
         except Exception as exc:
             print(f"log_tool failed for {tool}: {type(exc).__name__}")
 

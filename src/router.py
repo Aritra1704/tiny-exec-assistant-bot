@@ -61,30 +61,50 @@ def _extract_first_json_object(text: str) -> str | None:
     return None
 
 
+def _looks_like_tool_call_attempt(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        stripped.startswith("{")
+        or '"tool"' in stripped
+        or "'tool'" in stripped
+        or '"args"' in stripped
+        or "'args'" in stripped
+    )
+
+
 def parse_tool_call(text: str) -> dict[str, Any] | None:
     # Quick sanity checks:
     # parse_tool_call('{"tool":"save_note","args":{"text":"buy milk"}}') -> {"tool": ..., "args": ...}
     # parse_tool_call('Sure: {"tool":"list_notes","args":{"limit":3}}') -> {"tool": ..., "args": ...}
     # parse_tool_call("No JSON here") -> None
     raw_text = text.strip()
-    candidates = [raw_text]
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if (
+        isinstance(parsed, dict)
+        and isinstance(parsed.get("tool"), str)
+        and isinstance(parsed.get("args"), dict)
+    ):
+        return parsed
 
     extracted = _extract_first_json_object(raw_text)
-    if extracted and extracted != raw_text:
-        candidates.append(extracted)
+    if not extracted:
+        return None
 
-    for candidate in candidates:
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
+    try:
+        parsed = json.loads(extracted)
+    except json.JSONDecodeError:
+        return None
 
-        if (
-            isinstance(parsed, dict)
-            and isinstance(parsed.get("tool"), str)
-            and isinstance(parsed.get("args"), dict)
-        ):
-            return parsed
+    if (
+        isinstance(parsed, dict)
+        and isinstance(parsed.get("tool"), str)
+        and isinstance(parsed.get("args"), dict)
+    ):
+        return parsed
 
     return None
 
@@ -149,8 +169,13 @@ def decide(user_text: str) -> dict[str, Any]:
         ]
     ).strip()
 
+    if _looks_like_tool_call_attempt(output):
+        print(f"router raw model output: {output}")
+
     parsed = parse_tool_call(output)
     if parsed is None:
+        if "{" in output and not _looks_like_tool_call_attempt(output):
+            print(f"router raw model output: {output}")
         return {"type": "text", "text": output}
 
     decision = _validate_tool_payload(parsed)
