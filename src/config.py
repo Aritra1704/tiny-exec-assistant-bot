@@ -20,13 +20,24 @@ def _get_int(name: str, default: int) -> int:
         raise ConfigError(f"{name} must be an integer.") from exc
 
 
+def _get_bool(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name, "true" if default else "false").strip().lower()
+    if raw_value in {"1", "true", "yes", "on"}:
+        return True
+    if raw_value in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{name} must be true or false.")
+
+
 @dataclass(slots=True)
 class Config:
     OLLAMA_URL: str
     OLLAMA_CHAT_MODEL: str
     OLLAMA_EMBED_MODEL: str
+    OLLAMA_CREATIVE_MODEL: str
     RAG_TOP_K: int
     EMBED_MAX_CHARS: int
+    CREATIVE_INTENT_ROUTING: bool
     PG_HOST: str
     PG_PORT: int
     PG_DATABASE: str
@@ -44,8 +55,10 @@ class Config:
             OLLAMA_URL=os.getenv("OLLAMA_URL", "http://localhost:11434").strip(),
             OLLAMA_CHAT_MODEL=os.getenv("OLLAMA_MODEL", "").strip(),
             OLLAMA_EMBED_MODEL=os.getenv("OLLAMA_EMBED_MODEL", "").strip(),
+            OLLAMA_CREATIVE_MODEL=os.getenv("OLLAMA_CREATIVE_MODEL", "").strip(),
             RAG_TOP_K=_get_int("RAG_TOP_K", 5),
             EMBED_MAX_CHARS=_get_int("EMBED_MAX_CHARS", 2000),
+            CREATIVE_INTENT_ROUTING=_get_bool("CREATIVE_INTENT_ROUTING", True),
             PG_HOST=os.getenv("PG_HOST", "localhost").strip(),
             PG_PORT=_get_int("PG_PORT", 5432),
             PG_DATABASE=os.getenv("PG_DATABASE", "postgres").strip(),
@@ -86,6 +99,7 @@ class Config:
                 "config loaded "
                 f"chat_model={self.OLLAMA_CHAT_MODEL} "
                 f"embed_model={self.OLLAMA_EMBED_MODEL} "
+                f"creative_model={self.OLLAMA_CREATIVE_MODEL or self.OLLAMA_CHAT_MODEL} "
                 f"rag_top_k={self.RAG_TOP_K} "
                 f"ollama_url={self.OLLAMA_URL} "
                 f"pg={self.PG_HOST}/{self.PG_DATABASE}/{self.PG_SCHEMA}"

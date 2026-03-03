@@ -29,8 +29,10 @@ class StoreSmokeTests(unittest.TestCase):
                 OLLAMA_URL="http://localhost:11434",
                 OLLAMA_CHAT_MODEL="llama3.1:8b",
                 OLLAMA_EMBED_MODEL="nomic-embed-text",
+                OLLAMA_CREATIVE_MODEL="llama3.1:70b",
                 RAG_TOP_K=5,
                 EMBED_MAX_CHARS=2000,
+                CREATIVE_INTENT_ROUTING=True,
                 PG_HOST="localhost",
                 PG_PORT=5432,
                 PG_DATABASE="postgres",
@@ -145,6 +147,7 @@ class StoreSmokeTests(unittest.TestCase):
         self.assertEqual(result["verbosity"], "medium")
         self.assertEqual(result["timezone"], "Asia/Kolkata")
         self.assertEqual(result["executive_mode"], True)
+        self.assertEqual(result["mode"], "exec")
         cursor.execute.assert_called_once()
         conn.commit.assert_not_called()
 
@@ -156,6 +159,7 @@ class StoreSmokeTests(unittest.TestCase):
                 "verbosity": "medium",
                 "timezone": "Asia/Kolkata",
                 "executive_mode": True,
+                "mode": "exec",
             }
         )
 
@@ -166,6 +170,50 @@ class StoreSmokeTests(unittest.TestCase):
         sql, params = cursor.execute.call_args.args
         self.assertIn("user_preferences", sql)
         self.assertEqual(params, [321, "strict"])
+
+    def test_get_persona_returns_inserted_default_row(self):
+        conn, cursor = _mock_connection(
+            fetchone=None
+        )
+        cursor.fetchone.side_effect = [
+            None,
+            {
+                "chat_id": 321,
+                "name": "Akira",
+                "voice": "calm executive assistant",
+                "humor_level": 1,
+                "creativity_level": 4,
+                "signature": "",
+            },
+        ]
+
+        with patch("src.memory.store._conn", return_value=conn):
+            result = store.get_persona(321)
+
+        self.assertEqual(result["name"], "Akira")
+        self.assertEqual(result["voice"], "calm executive assistant")
+        self.assertEqual(cursor.execute.call_count, 2)
+        conn.commit.assert_called_once_with()
+
+    def test_upsert_persona_updates_requested_fields(self):
+        conn, cursor = _mock_connection(
+            fetchone={
+                "chat_id": 321,
+                "name": "Akira",
+                "voice": "calm executive assistant",
+                "humor_level": 4,
+                "creativity_level": 4,
+                "signature": "",
+            }
+        )
+
+        with patch("src.memory.store._conn", return_value=conn):
+            result = store.upsert_persona(321, {"humor_level": 4})
+
+        self.assertEqual(result["humor_level"], 4)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("persona", sql)
+        self.assertEqual(params, [321, 4])
 
     def test_save_message_embedding_upserts_vector_row(self):
         conn, cursor = _mock_connection(fetchone={"id": 77})

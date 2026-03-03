@@ -12,6 +12,14 @@ DEFAULT_USER_PREFERENCES = {
     "verbosity": "medium",
     "timezone": "Asia/Kolkata",
     "executive_mode": True,
+    "mode": "exec",
+}
+DEFAULT_PERSONA = {
+    "name": "Akira",
+    "voice": "calm executive assistant",
+    "humor_level": 1,
+    "creativity_level": 4,
+    "signature": "",
 }
 
 
@@ -105,7 +113,18 @@ def init_db():
       tone TEXT DEFAULT 'calm',
       verbosity TEXT DEFAULT 'medium',
       timezone TEXT DEFAULT 'Asia/Kolkata',
-      executive_mode BOOLEAN DEFAULT true
+      executive_mode BOOLEAN DEFAULT true,
+      mode TEXT DEFAULT 'exec'
+    );
+
+    CREATE TABLE IF NOT EXISTS {cfg.PG_SCHEMA}.persona (
+      chat_id BIGINT PRIMARY KEY,
+      name TEXT DEFAULT 'Akira',
+      voice TEXT DEFAULT 'calm executive assistant',
+      humor_level INT DEFAULT 1,
+      creativity_level INT DEFAULT 4,
+      signature TEXT DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS {cfg.PG_SCHEMA}.embedding_meta (
@@ -116,6 +135,12 @@ def init_db():
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(ddl)
+            cur.execute(
+                f"""
+                ALTER TABLE {cfg.PG_SCHEMA}.user_preferences
+                ADD COLUMN IF NOT EXISTS mode TEXT DEFAULT 'exec';
+                """
+            )
         conn.commit()
 
     embedding_dim = get_embedding_dim()
@@ -284,7 +309,7 @@ def get_messages_after(chat_id: int, last_message_id: int) -> list[dict]:
 def get_user_preferences(chat_id: int) -> dict:
     cfg = get_config(validate=True, require_telegram=False)
     q = f"""
-    SELECT chat_id, created_at, tone, verbosity, timezone, executive_mode
+    SELECT chat_id, created_at, tone, verbosity, timezone, executive_mode, mode
     FROM {cfg.PG_SCHEMA}.user_preferences
     WHERE chat_id = %s;
     """
@@ -299,7 +324,7 @@ def get_user_preferences(chat_id: int) -> dict:
 
 def upsert_user_preferences(chat_id: int, fields_dict: dict) -> dict:
     cfg = get_config(validate=True, require_telegram=False)
-    allowed_fields = {"tone", "verbosity", "timezone", "executive_mode"}
+    allowed_fields = {"tone", "verbosity", "timezone", "executive_mode", "mode"}
     updates = {key: value for key, value in fields_dict.items() if key in allowed_fields}
     if not updates:
         return get_user_preferences(chat_id)
@@ -312,7 +337,7 @@ def upsert_user_preferences(chat_id: int, fields_dict: dict) -> dict:
     VALUES (%s, {placeholders})
     ON CONFLICT (chat_id) DO UPDATE
     SET {assignments}
-    RETURNING chat_id, created_at, tone, verbosity, timezone, executive_mode;
+    RETURNING chat_id, created_at, tone, verbosity, timezone, executive_mode, mode;
     """
     params = [int(chat_id), *updates.values()]
     with _conn() as conn:
@@ -396,3 +421,64 @@ def iter_chat_messages(after_id: int = 0, batch_size: int = 100) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(q, (int(after_id), safe_batch_size))
             return cur.fetchall()
+
+
+def get_persona(chat_id: int) -> dict:
+    cfg = get_config(validate=True, require_telegram=False)
+    q = f"""
+    SELECT chat_id, created_at, name, voice, humor_level, creativity_level, signature
+    FROM {cfg.PG_SCHEMA}.persona
+    WHERE chat_id = %s;
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (int(chat_id),))
+            row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    f"""
+                    INSERT INTO {cfg.PG_SCHEMA}.persona(chat_id)
+                    VALUES (%s)
+                    ON CONFLICT (chat_id) DO NOTHING
+                    RETURNING chat_id, created_at, name, voice, humor_level, creativity_level, signature;
+                    """,
+                    (int(chat_id),),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(q, (int(chat_id),))
+                    row = cur.fetchone()
+        conn.commit()
+    if row is None:
+        return {"chat_id": int(chat_id), **DEFAULT_PERSONA}
+    normalized = {"chat_id": int(chat_id), **DEFAULT_PERSONA}
+    normalized.update(row)
+    return normalized
+
+
+def upsert_persona(chat_id: int, fields_dict: dict) -> dict:
+    cfg = get_config(validate=True, require_telegram=False)
+    allowed_fields = {"name", "voice", "humor_level", "creativity_level", "signature"}
+    updates = {key: value for key, value in fields_dict.items() if key in allowed_fields}
+    if not updates:
+        return get_persona(chat_id)
+
+    columns = ", ".join(updates.keys())
+    placeholders = ", ".join(["%s"] * len(updates))
+    assignments = ", ".join(f"{column} = EXCLUDED.{column}" for column in updates.keys())
+    q = f"""
+    INSERT INTO {cfg.PG_SCHEMA}.persona(chat_id, {columns})
+    VALUES (%s, {placeholders})
+    ON CONFLICT (chat_id) DO UPDATE
+    SET {assignments}
+    RETURNING chat_id, created_at, name, voice, humor_level, creativity_level, signature;
+    """
+    params = [int(chat_id), *updates.values()]
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, params)
+            row = cur.fetchone()
+        conn.commit()
+    normalized = {"chat_id": int(chat_id), **DEFAULT_PERSONA}
+    normalized.update(row)
+    return normalized

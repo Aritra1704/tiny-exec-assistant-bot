@@ -17,8 +17,10 @@ def _test_config() -> Config:
         OLLAMA_URL="http://localhost:11434",
         OLLAMA_CHAT_MODEL="llama3.1:8b",
         OLLAMA_EMBED_MODEL="nomic-embed-text",
+        OLLAMA_CREATIVE_MODEL="llama3.1:70b",
         RAG_TOP_K=5,
         EMBED_MAX_CHARS=2000,
+        CREATIVE_INTENT_ROUTING=True,
         PG_HOST="localhost",
         PG_PORT=5432,
         PG_DATABASE="postgres",
@@ -67,6 +69,8 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         context = _DummyContext()
 
         with (
+            patch("src.bot.get_config", return_value=_test_config()),
+            patch("src.bot._get_persona", new=AsyncMock(return_value=bot._normalize_persona(None))),
             patch(
                 "src.bot.decide",
                 return_value={
@@ -107,6 +111,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         with (
+            patch("src.bot.get_config", return_value=_test_config()),
             patch(
                 "src.bot.decide",
                 return_value={"type": "text", "text": "Let me think about that."},
@@ -126,11 +131,14 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                     "verbosity": "short",
                     "timezone": "UTC",
                     "executive_mode": True,
+                    "mode": "exec",
                 },
             ),
+            patch("src.bot._get_persona", new=AsyncMock(return_value={"name": "Akira", "voice": "calm executive assistant", "humor_level": 1, "creativity_level": 4, "signature": ""})),
             patch("src.bot._get_relevant_memory", new=AsyncMock(return_value=["Discussed payroll cutoff."])) as relevant_memory_mock,
             patch("src.bot.get_messages_after", return_value=history_rows) as get_messages_after_mock,
             patch("src.bot.chat", return_value="Here is the concise summary.") as chat_mock,
+            patch("src.bot._log_llm_call", new=AsyncMock()) as log_llm_call_mock,
             patch("builtins.print") as print_mock,
             patch("src.bot._maybe_summarize", new=AsyncMock()) as maybe_summarize_mock,
         ):
@@ -138,9 +146,10 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
 
         get_messages_after_mock.assert_called_once_with(321, 40)
         relevant_memory_mock.assert_awaited_once()
-        chat_mock.assert_called_once()
+        chat_mock.assert_called_once_with(unittest.mock.ANY, "llama3.1:8b")
         messages = chat_mock.call_args.args[0]
         self.assertIn(SYSTEM_PROMPT, messages[0]["content"])
+        self.assertIn("Your name is Akira.", messages[0]["content"])
         self.assertIn("Tone: strict, direct, and disciplined.", messages[0]["content"])
         self.assertIn("Be concise.", messages[0]["content"])
         self.assertIn("Assume the user's timezone is UTC", messages[0]["content"])
@@ -176,9 +185,10 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         print_mock.assert_any_call(
-            'loaded preferences for chat_id 321: {"executive_mode": true, "timezone": "UTC", "tone": "strict", "verbosity": "short"}'
+            'loaded preferences for chat_id 321: {"executive_mode": true, "mode": "exec", "timezone": "UTC", "tone": "strict", "verbosity": "short"}'
         )
         print_mock.assert_any_call("Loaded 15 previous messages for chat_id 321")
+        log_llm_call_mock.assert_awaited_once_with("llama3.1:8b", "exec", False, True, "Here is the concise summary.")
         maybe_summarize_mock.assert_awaited_once_with(321)
         update.message.reply_text.assert_awaited_once_with("Here is the concise summary.")
 
@@ -188,12 +198,15 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         context = _DummyContext()
 
         with (
+            patch("src.bot.get_config", return_value=_test_config()),
             patch(
                 "src.bot.decide",
                 return_value={"type": "text", "text": "In how many minutes?"},
             ),
+            patch("src.bot._get_persona", new=AsyncMock(return_value=bot._normalize_persona(None))),
             patch("src.bot.save_message") as save_message_mock,
             patch("src.bot.chat") as chat_mock,
+            patch("src.bot._log_llm_call", new=AsyncMock()) as log_llm_call_mock,
             patch("src.bot._maybe_summarize", new=AsyncMock()) as maybe_summarize_mock,
         ):
             await bot.on_message(update, context)
@@ -206,6 +219,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                 unittest.mock.call(321, "assistant", "In how many minutes?"),
             ],
         )
+        log_llm_call_mock.assert_awaited_once_with("llama3.1:8b", "exec", False, True, "In how many minutes?")
         maybe_summarize_mock.assert_awaited_once_with(321)
         update.message.reply_text.assert_awaited_once_with("In how many minutes?")
 
@@ -224,13 +238,18 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                     "verbosity": "detailed",
                     "timezone": "America/New_York",
                     "executive_mode": False,
+                    "mode": "creative",
                 },
+                persona={"name": "Akira", "voice": "calm executive assistant", "humor_level": 2, "creativity_level": 7, "signature": "Akira"},
+                creative_active=True,
                 relevant_memory=["Discussed quarterly staffing."],
             )
 
         self.assertIn(SYSTEM_PROMPT, messages[0]["content"])
+        self.assertIn("Your name is Akira.", messages[0]["content"])
         self.assertIn("Tone: casual, conversational, and approachable.", messages[0]["content"])
         self.assertIn("Give more detail.", messages[0]["content"])
+        self.assertIn("Use vivid but concise language.", messages[0]["content"])
         self.assertEqual(
             messages[1],
             {
@@ -248,6 +267,51 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[3], {"role": "assistant", "content": "Short reply"})
         self.assertEqual(len(messages[4]["content"]), _test_config().CHAT_CONTEXT_CHAR_LIMIT)
         self.assertTrue(messages[4]["content"].endswith("..."))
+
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_on_message_uses_creative_model_when_mode_is_creative(self):
+        update = _DummyUpdate("Write a short birthday greeting for my sister.")
+        context = _DummyContext()
+
+        with (
+            patch("src.bot.get_config", return_value=_test_config()),
+            patch("src.bot.decide", return_value={"type": "text", "text": "Let me think about that."}),
+            patch("src.bot.save_message") as save_message_mock,
+            patch("src.bot.get_last_summary", return_value=None),
+            patch(
+                "src.bot.get_user_preferences",
+                return_value={
+                    "tone": "calm",
+                    "verbosity": "medium",
+                    "timezone": "Asia/Kolkata",
+                    "executive_mode": True,
+                    "mode": "creative",
+                },
+            ),
+            patch("src.bot._get_persona", new=AsyncMock(return_value=bot._normalize_persona(None))),
+            patch("src.bot._get_relevant_memory", new=AsyncMock(return_value=[])),
+            patch("src.bot.get_messages_after", return_value=[]),
+            patch("src.bot.chat", return_value="Happy birthday to the brightest light in every room.") as chat_mock,
+            patch("src.bot._log_llm_call", new=AsyncMock()) as log_llm_call_mock,
+            patch("src.bot._maybe_summarize", new=AsyncMock()),
+        ):
+            await bot.on_message(update, context)
+
+        chat_mock.assert_called_once_with(unittest.mock.ANY, "llama3.1:70b")
+        log_llm_call_mock.assert_awaited_once_with(
+            "llama3.1:70b",
+            "creative",
+            True,
+            True,
+            "Happy birthday to the brightest light in every room.",
+        )
+        self.assertEqual(
+            save_message_mock.call_args_list,
+            [
+                unittest.mock.call(321, "user", "Write a short birthday greeting for my sister."),
+                unittest.mock.call(321, "assistant", "Happy birthday to the brightest light in every room."),
+            ],
+        )
 
     @patch("src.bot.asyncio.to_thread", new=_run_inline)
     async def test_save_chat_message_also_saves_embedding_for_natural_language(self):
@@ -399,7 +463,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "src.bot.upsert_user_preferences",
-                return_value={"tone": "strict", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": True},
+                return_value={"tone": "strict", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": True, "mode": "exec"},
             ),
             patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
             patch("src.bot.save_message") as save_message_mock,
@@ -410,7 +474,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         log_tool_mock.assert_awaited_once_with(
             "set_prefs",
             {"tone": "strict"},
-            {"tone": "strict", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": True},
+            {"tone": "strict", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": True, "mode": "exec"},
         )
         self.assertEqual(
             save_message_mock.call_args_list,
@@ -430,7 +494,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "src.bot.upsert_user_preferences",
-                return_value={"tone": "calm", "verbosity": "short", "timezone": "Asia/Kolkata", "executive_mode": True},
+                return_value={"tone": "calm", "verbosity": "short", "timezone": "Asia/Kolkata", "executive_mode": True, "mode": "exec"},
             ),
             patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
             patch("src.bot.save_message") as save_message_mock,
@@ -441,7 +505,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         log_tool_mock.assert_awaited_once_with(
             "set_prefs",
             {"verbosity": "short"},
-            {"tone": "calm", "verbosity": "short", "timezone": "Asia/Kolkata", "executive_mode": True},
+            {"tone": "calm", "verbosity": "short", "timezone": "Asia/Kolkata", "executive_mode": True, "mode": "exec"},
         )
         self.assertEqual(
             save_message_mock.call_args_list,
@@ -461,7 +525,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "src.bot.upsert_user_preferences",
-                return_value={"tone": "calm", "verbosity": "medium", "timezone": "UTC", "executive_mode": True},
+                return_value={"tone": "calm", "verbosity": "medium", "timezone": "UTC", "executive_mode": True, "mode": "exec"},
             ),
             patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
             patch("src.bot.save_message") as save_message_mock,
@@ -472,7 +536,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         log_tool_mock.assert_awaited_once_with(
             "set_prefs",
             {"timezone": "UTC"},
-            {"tone": "calm", "verbosity": "medium", "timezone": "UTC", "executive_mode": True},
+            {"tone": "calm", "verbosity": "medium", "timezone": "UTC", "executive_mode": True, "mode": "exec"},
         )
         self.assertEqual(
             save_message_mock.call_args_list,
@@ -492,7 +556,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "src.bot.upsert_user_preferences",
-                return_value={"tone": "calm", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": False},
+                return_value={"tone": "calm", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": False, "mode": "exec"},
             ),
             patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
             patch("src.bot.save_message") as save_message_mock,
@@ -503,7 +567,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         log_tool_mock.assert_awaited_once_with(
             "set_prefs",
             {"executive_mode": False},
-            {"tone": "calm", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": False},
+            {"tone": "calm", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": False, "mode": "exec"},
         )
         self.assertEqual(
             save_message_mock.call_args_list,
@@ -528,6 +592,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                     "verbosity": "medium",
                     "timezone": "Asia/Kolkata",
                     "executive_mode": True,
+                    "mode": "exec",
                 },
             ),
             patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
@@ -546,6 +611,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                 "verbosity": "medium",
                 "timezone": "Asia/Kolkata",
                 "executive_mode": True,
+                "mode": "exec",
             },
         )
         self.assertEqual(
@@ -555,13 +621,13 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                 unittest.mock.call(
                     321,
                     "assistant",
-                    "Current preferences:\ntone=calm\nverbosity=medium\ntimezone=Asia/Kolkata\nexecutive_mode=True",
+                    "Current preferences:\ntone=calm\nverbosity=medium\ntimezone=Asia/Kolkata\nexecutive_mode=True\nmode=exec",
                 ),
             ],
         )
         maybe_summarize_mock.assert_awaited_once_with(321)
         update.message.reply_text.assert_awaited_once_with(
-            "Current preferences:\ntone=calm\nverbosity=medium\ntimezone=Asia/Kolkata\nexecutive_mode=True"
+            "Current preferences:\ntone=calm\nverbosity=medium\ntimezone=Asia/Kolkata\nexecutive_mode=True\nmode=exec"
         )
 
     @patch("src.bot.asyncio.to_thread", new=_run_inline)
@@ -599,6 +665,99 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         )
 
     @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_mode_command_updates_mode(self):
+        update = _DummyUpdate("/mode creative")
+        context = _DummyContext(args=["creative"])
+
+        with (
+            patch(
+                "src.bot.upsert_user_preferences",
+                return_value={
+                    "tone": "calm",
+                    "verbosity": "medium",
+                    "timezone": "Asia/Kolkata",
+                    "executive_mode": True,
+                    "mode": "creative",
+                },
+            ),
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
+            patch("src.bot.save_message") as save_message_mock,
+            patch("src.bot._maybe_summarize", new=AsyncMock()) as maybe_summarize_mock,
+        ):
+            await bot.mode_command(update, context)
+
+        log_tool_mock.assert_awaited_once_with(
+            "set_prefs",
+            {"mode": "creative"},
+            {
+                "tone": "calm",
+                "verbosity": "medium",
+                "timezone": "Asia/Kolkata",
+                "executive_mode": True,
+                "mode": "creative",
+            },
+        )
+        self.assertEqual(
+            save_message_mock.call_args_list,
+            [
+                unittest.mock.call(321, "user", "/mode creative"),
+                unittest.mock.call(321, "assistant", "Mode set to creative."),
+            ],
+        )
+        maybe_summarize_mock.assert_awaited_once_with(321)
+        update.message.reply_text.assert_awaited_once_with("Mode set to creative.")
+
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_persona_command_shows_current_persona(self):
+        update = _DummyUpdate("/persona")
+        context = _DummyContext()
+
+        with (
+            patch(
+                "src.bot.get_persona",
+                return_value={
+                    "name": "Akira",
+                    "voice": "calm executive assistant",
+                    "humor_level": 2,
+                    "creativity_level": 6,
+                    "signature": "",
+                },
+            ),
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
+            patch("src.bot.save_message") as save_message_mock,
+            patch("src.bot._maybe_summarize", new=AsyncMock()) as maybe_summarize_mock,
+        ):
+            await bot.persona_command(update, context)
+
+        log_tool_mock.assert_awaited_once_with(
+            "get_persona",
+            {"chat_id": 321},
+            {
+                "ok": True,
+                "name": "Akira",
+                "voice": "calm executive assistant",
+                "humor_level": 2,
+                "creativity_level": 6,
+                "signature": "",
+            },
+        )
+        self.assertEqual(
+            save_message_mock.call_args_list,
+            [
+                unittest.mock.call(321, "user", "/persona"),
+                unittest.mock.call(
+                    321,
+                    "assistant",
+                    "Persona:\nname=Akira\nvoice=calm executive assistant\nhumor_level=2\ncreativity_level=6\nsignature=(none)",
+                ),
+            ],
+        )
+        maybe_summarize_mock.assert_awaited_once_with(321)
+        update.message.reply_text.assert_awaited_once_with(
+            "Persona:\nname=Akira\nvoice=calm executive assistant\nhumor_level=2\ncreativity_level=6\nsignature=(none)"
+        )
+
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
     async def test_models_command_reports_runtime_models(self):
         update = _DummyUpdate("/models")
         context = _DummyContext()
@@ -619,9 +778,11 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                 "ok": True,
                 "chat_model": "llama3.1:8b",
                 "embed_model": "nomic-embed-text",
+                "creative_model": "llama3.1:70b",
                 "rag_top_k": 5,
                 "embedding_dim": 768,
                 "ollama_url": "http://localhost:11434",
+                "creative_intent_routing": True,
             },
         )
         self.assertEqual(save_chat_message_mock.await_count, 2)
@@ -630,8 +791,10 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
             "Models:\n"
             "chat=llama3.1:8b\n"
             "embed=nomic-embed-text\n"
+            "creative=llama3.1:70b\n"
             "rag_top_k=5\n"
             "embedding_dim=768\n"
+            "creative_intent_routing=True\n"
             "ollama_url=http://localhost:11434"
         )
 
@@ -675,5 +838,5 @@ class BotStartupSmokeTests(unittest.TestCase):
         init_db_mock.assert_called_once_with()
         health_check_mock.assert_called_once_with()
         self.assertEqual(fake_builder.token_value, "telegram-token")
-        self.assertEqual(len(fake_app.handlers), 11)
+        self.assertEqual(len(fake_app.handlers), 16)
         fake_app.run_polling.assert_called_once()

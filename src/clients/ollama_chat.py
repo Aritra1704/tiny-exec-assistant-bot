@@ -8,9 +8,13 @@ def _ollama_not_reachable_message() -> str:
     return f"Ollama not reachable at {cfg.OLLAMA_URL}. Is ollama running?"
 
 
-def chat(messages: list[dict], timeout: int = 120) -> str:
+def chat(messages: list[dict], model: str | None = None, timeout: int = 120) -> str:
     cfg = get_config(validate=True, require_telegram=False)
-    payload = {"model": cfg.OLLAMA_CHAT_MODEL, "messages": messages, "stream": False}
+    payload = {
+        "model": model or cfg.OLLAMA_CHAT_MODEL,
+        "messages": messages,
+        "stream": False,
+    }
     try:
         response = requests.post(
             f"{cfg.OLLAMA_URL}/api/chat",

@@ -18,12 +18,14 @@ from src.memory.store import (
     get_embedding_dim,
     get_last_summary,
     get_messages_after,
+    get_persona,
     get_user_preferences,
     init_db,
     log_tool,
-    save_message_embedding,
     save_message,
+    save_message_embedding,
     search_similar_messages,
+    upsert_persona,
     upsert_user_preferences,
 )
 from src.memory.summarizer import maybe_summarize
@@ -36,6 +38,27 @@ DETAILED_HISTORY_LIMIT = 15
 DEBUG_TEXT_LIMIT = 80
 VALID_TONES = {"calm", "strict", "casual"}
 VALID_VERBOSITY = {"short", "medium", "detailed"}
+VALID_MODES = {"exec", "creative", "dev"}
+CREATIVE_INTENT_TERMS = {
+    "caption",
+    "captions",
+    "greeting",
+    "greetings",
+    "ecard",
+    "card",
+    "poem",
+    "poetry",
+    "story",
+    "fiction",
+    "creative",
+    "tagline",
+    "slogan",
+    "headline",
+    "toast",
+    "wish",
+    "wishes",
+    "joke",
+}
 
 
 def _chat_context_char_limit() -> int:
@@ -52,22 +75,112 @@ def _normalize_preferences(preferences: dict | None) -> dict:
         "verbosity": "medium",
         "timezone": "Asia/Kolkata",
         "executive_mode": True,
+        "mode": "exec",
     }
     if preferences:
+        mode_value = str(preferences.get("mode", base["mode"]) or base["mode"])
+        if mode_value not in VALID_MODES:
+            mode_value = base["mode"]
         base.update(
             {
                 "tone": preferences.get("tone", base["tone"]),
                 "verbosity": preferences.get("verbosity", base["verbosity"]),
                 "timezone": preferences.get("timezone", base["timezone"]),
                 "executive_mode": bool(preferences.get("executive_mode", base["executive_mode"])),
+                "mode": mode_value,
             }
         )
     return base
 
 
-def _build_dynamic_system_prompt(preferences: dict | None) -> str:
+def _normalize_persona(persona: dict | None) -> dict:
+    base = {
+        "name": "Akira",
+        "voice": "calm executive assistant",
+        "humor_level": 1,
+        "creativity_level": 4,
+        "signature": "",
+    }
+    if persona:
+        humor_level = persona.get("humor_level", base["humor_level"])
+        creativity_level = persona.get("creativity_level", base["creativity_level"])
+        base.update(
+            {
+                "name": str(persona.get("name", base["name"]) or base["name"]),
+                "voice": str(persona.get("voice", base["voice"]) or base["voice"]),
+                "humor_level": int(
+                    base["humor_level"] if humor_level is None else humor_level
+                ),
+                "creativity_level": int(
+                    base["creativity_level"] if creativity_level is None else creativity_level
+                ),
+                "signature": str(persona.get("signature", base["signature"]) or ""),
+            }
+        )
+    return base
+
+
+def _is_creative_intent(user_text: str) -> bool:
+    cfg = get_config()
+    if not cfg.CREATIVE_INTENT_ROUTING:
+        return False
+
+    lowered = user_text.strip().lower()
+    if not lowered:
+        return False
+
+    if any(term in lowered for term in CREATIVE_INTENT_TERMS):
+        return True
+
+    creative_phrases = (
+        "write a",
+        "write me",
+        "draft a",
+        "compose a",
+        "make this more creative",
+        "brainstorm names",
+        "short story",
+        "bedtime story",
+        "instagram caption",
+        "birthday message",
+    )
+    return any(phrase in lowered for phrase in creative_phrases)
+
+
+def _creative_mode_active(preferences: dict | None, user_text: str) -> bool:
     normalized = _normalize_preferences(preferences)
+    return normalized["mode"] == "creative" or _is_creative_intent(user_text)
+
+
+def _select_chat_model(creative_active: bool) -> str:
+    cfg = get_config()
+    if creative_active:
+        return cfg.OLLAMA_CREATIVE_MODEL or cfg.OLLAMA_CHAT_MODEL
+    return cfg.OLLAMA_CHAT_MODEL
+
+
+def _build_dynamic_system_prompt(
+    preferences: dict | None,
+    persona: dict | None = None,
+    creative_active: bool = False,
+) -> str:
+    normalized = _normalize_preferences(preferences)
+    persona_data = _normalize_persona(persona)
     additions = [SYSTEM_PROMPT]
+    additions.append(
+        f"Your name is {persona_data['name']}. Maintain the voice of a {persona_data['voice']}."
+    )
+    additions.append(
+        f"Keep humor subtle at about {persona_data['humor_level']}/10 unless the user invites more."
+    )
+    additions.append(
+        f"Default creativity level is {persona_data['creativity_level']}/10."
+    )
+    additions.append("Do not over-introduce yourself or mention your name unless it helps.")
+    if persona_data["signature"]:
+        additions.append(
+            f"Optional signature for closings or creative pieces when suitable: {persona_data['signature']}"
+        )
 
     tone = normalized["tone"]
     if tone == "strict":
@@ -89,6 +202,17 @@ def _build_dynamic_system_prompt(preferences: dict | None) -> str:
         additions.append("Maintain an executive assistant mindset and prioritize decisions, tasks, and outcomes.")
     else:
         additions.append("Do not force executive assistant phrasing unless the user asks for it.")
+
+    mode = normalized["mode"]
+    if mode == "dev":
+        additions.append("Mode: dev. Be technical, concrete, and implementation-focused.")
+    elif mode == "exec":
+        additions.append("Mode: exec. Prioritize clarity, decisions, and next actions.")
+
+    if creative_active:
+        additions.append(
+            "Use vivid but concise language. Produce 3 options when asked for greetings/captions. Avoid clichés unless requested."
+        )
 
     additions.append(f"Assume the user's timezone is {normalized['timezone']} when time context matters.")
     return "\n\n".join(additions)
@@ -170,9 +294,20 @@ def _build_chat_context(
     history_rows: list[dict],
     summary_text: str | None = None,
     preferences: dict | None = None,
+    persona: dict | None = None,
+    creative_active: bool = False,
     relevant_memory: list[str] | None = None,
 ) -> list[dict]:
-    messages = [{"role": "system", "content": _build_dynamic_system_prompt(preferences)}]
+    messages = [
+        {
+            "role": "system",
+            "content": _build_dynamic_system_prompt(
+                preferences,
+                persona=persona,
+                creative_active=creative_active,
+            ),
+        }
+    ]
     if summary_text:
         messages.append(
             {
@@ -242,6 +377,15 @@ async def _get_preferences(chat_id: int) -> dict:
     except Exception as exc:
         print(f"preferences load failed for chat_id {chat_id}: {type(exc).__name__}")
         return _normalize_preferences(None)
+
+
+async def _get_persona(chat_id: int) -> dict:
+    try:
+        persona = await asyncio.to_thread(get_persona, chat_id)
+        return _normalize_persona(persona)
+    except Exception as exc:
+        print(f"persona load failed for chat_id {chat_id}: {type(exc).__name__}")
+        return _normalize_persona(None)
 
 
 async def _get_chat_history(chat_id: int) -> tuple[str | None, list[dict]]:
@@ -333,6 +477,21 @@ async def _log_tool_result(tool: str, args: dict, result: dict) -> None:
         print(f"log_tool failed for {tool}: {type(exc).__name__}")
 
 
+async def _log_llm_call(model: str, mode: str, creative_active: bool, ok: bool, reply: str) -> None:
+    result = {"ok": ok, "reply_length": len(reply)}
+    if not ok:
+        result["error"] = reply
+    await _log_tool_result(
+        "llm_call",
+        {
+            "model": model,
+            "mode": mode,
+            "creative_active": creative_active,
+        },
+        result,
+    )
+
+
 async def _run_preference_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -356,6 +515,36 @@ async def _run_preference_command(
         )
     except Exception as exc:
         reply = f"Couldn’t update preferences: {type(exc).__name__}"
+
+    await update.message.reply_text(reply)
+    await _save_chat_message(chat_id, "assistant", reply)
+    await _maybe_summarize(chat_id)
+
+
+async def _run_persona_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    fields: dict,
+    reply_text: str | None = None,
+) -> None:
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    try:
+        result = await asyncio.to_thread(upsert_persona, chat_id, fields)
+        await _log_tool_result("set_persona", fields, result)
+        persona = _normalize_persona(result)
+        reply = reply_text or (
+            "Persona updated:\n"
+            f"name={persona['name']}\n"
+            f"voice={persona['voice']}\n"
+            f"humor_level={persona['humor_level']}\n"
+            f"creativity_level={persona['creativity_level']}\n"
+            f"signature={persona['signature'] or '(none)'}"
+        )
+    except Exception as exc:
+        reply = f"Couldn’t update persona: {type(exc).__name__}"
 
     await update.message.reply_text(reply)
     await _save_chat_message(chat_id, "assistant", reply)
@@ -413,6 +602,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     user_message_id = await _save_chat_message(chat_id, "user", user_text)
     preferences = await _get_preferences(chat_id)
+    persona = await _get_persona(chat_id)
+    creative_active = _creative_mode_active(preferences, user_text)
+    selected_model = _select_chat_model(creative_active)
 
     decision = await asyncio.to_thread(decide, user_text)
     print(f'router decision type="{decision["type"]}"')
@@ -427,8 +619,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if decision.get("source") == "router_error" or _should_use_router_text(decision.get("text", "")):
+    if decision.get("source") == "router_error":
         reply = decision["text"]
+        await _log_llm_call(get_config().OLLAMA_CHAT_MODEL, preferences["mode"], False, False, reply)
+    elif _should_use_router_text(decision.get("text", "")):
+        reply = decision["text"]
+        await _log_llm_call(get_config().OLLAMA_CHAT_MODEL, preferences["mode"], False, True, reply)
     else:
         summary_text, history_rows = await _get_chat_history(chat_id)
         relevant_memory = await _get_relevant_memory(chat_id, user_text, user_message_id)
@@ -436,12 +632,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             history_rows,
             summary_text=summary_text,
             preferences=preferences,
+            persona=persona,
+            creative_active=creative_active,
             relevant_memory=relevant_memory,
         )
         try:
-            reply = await asyncio.to_thread(chat, messages)
+            reply = await asyncio.to_thread(chat, messages, selected_model)
+            await _log_llm_call(selected_model, preferences["mode"], creative_active, True, reply)
         except RuntimeError as exc:
             reply = str(exc)
+            await _log_llm_call(selected_model, preferences["mode"], creative_active, False, reply)
 
     await update.message.reply_text(reply)
     await _save_chat_message(chat_id, "assistant", reply)
@@ -629,6 +829,41 @@ async def exec_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f"CMD /mode args={json.dumps(context.args)}")
+    await _save_chat_message(chat_id, "user", user_text)
+
+    if not context.args:
+        preferences = await _get_preferences(chat_id)
+        result = {"ok": True, "mode": preferences["mode"]}
+        await _log_tool_result("get_mode", {"chat_id": chat_id}, result)
+        reply = f"Current mode: {preferences['mode']}."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        await _maybe_summarize(chat_id)
+        return
+
+    mode_value = context.args[0].strip().lower()
+    if mode_value not in VALID_MODES:
+        reply = "Use /mode exec, /mode creative, or /mode dev."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        await _maybe_summarize(chat_id)
+        return
+
+    await _run_preference_command(
+        update,
+        context,
+        {"mode": mode_value},
+        reply_text=f"Mode set to {mode_value}.",
+    )
+
+
 async def prefs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return
@@ -646,11 +881,120 @@ async def prefs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"tone={preferences['tone']}\n"
         f"verbosity={preferences['verbosity']}\n"
         f"timezone={preferences['timezone']}\n"
-        f"executive_mode={preferences['executive_mode']}"
+        f"executive_mode={preferences['executive_mode']}\n"
+        f"mode={preferences['mode']}"
     )
     await update.message.reply_text(reply)
     await _save_chat_message(chat_id, "assistant", reply)
     await _maybe_summarize(chat_id)
+
+
+async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print("CMD /persona args=[]")
+    await _save_chat_message(chat_id, "user", user_text)
+
+    persona = await _get_persona(chat_id)
+    result = {"ok": True, **persona}
+    await _log_tool_result("get_persona", {"chat_id": chat_id}, result)
+    reply = (
+        "Persona:\n"
+        f"name={persona['name']}\n"
+        f"voice={persona['voice']}\n"
+        f"humor_level={persona['humor_level']}\n"
+        f"creativity_level={persona['creativity_level']}\n"
+        f"signature={persona['signature'] or '(none)'}"
+    )
+    await update.message.reply_text(reply)
+    await _save_chat_message(chat_id, "assistant", reply)
+    await _maybe_summarize(chat_id)
+
+
+async def set_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f"CMD /set_name args={json.dumps(context.args)}")
+    await _save_chat_message(chat_id, "user", user_text)
+
+    name = " ".join(context.args).strip()
+    if not name:
+        reply = "Use /set_name <name>."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        await _maybe_summarize(chat_id)
+        return
+
+    await _run_persona_command(
+        update,
+        context,
+        {"name": name},
+        reply_text=f"Name set to {name}.",
+    )
+
+
+async def set_humor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f"CMD /set_humor args={json.dumps(context.args)}")
+    await _save_chat_message(chat_id, "user", user_text)
+
+    raw_value = context.args[0].strip() if context.args else ""
+    try:
+        humor_level = int(raw_value)
+    except ValueError:
+        humor_level = -1
+    if humor_level < 0 or humor_level > 10:
+        reply = "Use /set_humor <0-10>."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        await _maybe_summarize(chat_id)
+        return
+
+    await _run_persona_command(
+        update,
+        context,
+        {"humor_level": humor_level},
+        reply_text=f"Humor level set to {humor_level}.",
+    )
+
+
+async def set_creativity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f"CMD /set_creativity args={json.dumps(context.args)}")
+    await _save_chat_message(chat_id, "user", user_text)
+
+    raw_value = context.args[0].strip() if context.args else ""
+    try:
+        creativity_level = int(raw_value)
+    except ValueError:
+        creativity_level = -1
+    if creativity_level < 0 or creativity_level > 10:
+        reply = "Use /set_creativity <0-10>."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        await _maybe_summarize(chat_id)
+        return
+
+    await _run_persona_command(
+        update,
+        context,
+        {"creativity_level": creativity_level},
+        reply_text=f"Creativity level set to {creativity_level}.",
+    )
 
 
 async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -716,9 +1060,11 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ok": True,
         "chat_model": cfg.OLLAMA_CHAT_MODEL,
         "embed_model": cfg.OLLAMA_EMBED_MODEL,
+        "creative_model": cfg.OLLAMA_CREATIVE_MODEL or cfg.OLLAMA_CHAT_MODEL,
         "rag_top_k": cfg.RAG_TOP_K,
         "embedding_dim": embedding_dim,
         "ollama_url": cfg.OLLAMA_URL,
+        "creative_intent_routing": cfg.CREATIVE_INTENT_ROUTING,
     }
     await _log_tool_result("models_info", {"chat_id": chat_id}, result)
 
@@ -726,8 +1072,10 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Models:\n"
         f"chat={cfg.OLLAMA_CHAT_MODEL}\n"
         f"embed={cfg.OLLAMA_EMBED_MODEL}\n"
+        f"creative={cfg.OLLAMA_CREATIVE_MODEL or cfg.OLLAMA_CHAT_MODEL}\n"
         f"rag_top_k={cfg.RAG_TOP_K}\n"
         f"embedding_dim={embedding_dim if embedding_dim is not None else 'unknown'}\n"
+        f"creative_intent_routing={cfg.CREATIVE_INTENT_ROUTING}\n"
         f"ollama_url={cfg.OLLAMA_URL}"
     )
     await update.message.reply_text(reply)
@@ -760,6 +1108,11 @@ def main():
     app.add_handler(CommandHandler("set_tone", set_tone_command))
     app.add_handler(CommandHandler("set_verbosity", set_verbosity_command))
     app.add_handler(CommandHandler("set_timezone", set_timezone_command))
+    app.add_handler(CommandHandler("persona", persona_command))
+    app.add_handler(CommandHandler("set_name", set_name_command))
+    app.add_handler(CommandHandler("set_humor", set_humor_command))
+    app.add_handler(CommandHandler("set_creativity", set_creativity_command))
+    app.add_handler(CommandHandler("mode", mode_command))
     app.add_handler(CommandHandler("exec_mode", exec_mode_command))
     app.add_handler(CommandHandler("prefs", prefs_command))
     app.add_handler(CommandHandler("memory", memory_command))
