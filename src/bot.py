@@ -73,9 +73,9 @@ def _build_dynamic_system_prompt(preferences: dict | None) -> str:
 
     verbosity = normalized["verbosity"]
     if verbosity == "short":
-        additions.append("Respond concisely.")
+        additions.append("Be concise.")
     elif verbosity == "detailed":
-        additions.append("Respond with detailed, well-structured explanations when useful.")
+        additions.append("Give more detail.")
     else:
         additions.append("Keep responses medium length unless more detail is necessary.")
 
@@ -238,7 +238,6 @@ async def _log_tool_result(tool: str, args: dict, result: dict) -> None:
 async def _run_preference_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    tool: str,
     fields: dict,
     reply_text: str | None = None,
 ) -> None:
@@ -248,7 +247,7 @@ async def _run_preference_command(
     chat_id = update.effective_chat.id
     try:
         result = await asyncio.to_thread(upsert_user_preferences, chat_id, fields)
-        await _log_tool_result(tool, fields, result)
+        await _log_tool_result("set_prefs", fields, result)
         preferences = _normalize_preferences(result)
         reply = reply_text or (
             "Preferences updated:\n"
@@ -446,7 +445,6 @@ async def set_tone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_preference_command(
         update,
         context,
-        "set_tone",
         {"tone": tone},
         reply_text=f"Tone set to {tone}.",
     )
@@ -472,7 +470,6 @@ async def set_verbosity_command(update: Update, context: ContextTypes.DEFAULT_TY
     await _run_preference_command(
         update,
         context,
-        "set_verbosity",
         {"verbosity": verbosity},
         reply_text=f"Verbosity set to {verbosity}.",
     )
@@ -498,9 +495,34 @@ async def set_timezone_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await _run_preference_command(
         update,
         context,
-        "set_timezone",
         {"timezone": timezone_value},
         reply_text=f"Timezone set to {timezone_value}.",
+    )
+
+
+async def exec_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f"CMD /exec_mode args={json.dumps(context.args)}")
+    await _save_chat_message(chat_id, "user", user_text)
+
+    raw_value = (context.args[0].strip().lower() if context.args else "")
+    if raw_value not in {"on", "off"}:
+        reply = "Use /exec_mode on or /exec_mode off."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        await _maybe_summarize(chat_id)
+        return
+
+    executive_mode = raw_value == "on"
+    await _run_preference_command(
+        update,
+        context,
+        {"executive_mode": executive_mode},
+        reply_text=f"Executive mode {'enabled' if executive_mode else 'disabled'}.",
     )
 
 
@@ -515,7 +537,7 @@ async def prefs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     preferences = await _get_preferences(chat_id)
     result = {"ok": True, **preferences}
-    await _log_tool_result("show_preferences", {"chat_id": chat_id}, result)
+    await _log_tool_result("get_prefs", {"chat_id": chat_id}, result)
     reply = (
         "Current preferences:\n"
         f"tone={preferences['tone']}\n"
@@ -542,6 +564,7 @@ def main():
     app.add_handler(CommandHandler("set_tone", set_tone_command))
     app.add_handler(CommandHandler("set_verbosity", set_verbosity_command))
     app.add_handler(CommandHandler("set_timezone", set_timezone_command))
+    app.add_handler(CommandHandler("exec_mode", exec_mode_command))
     app.add_handler(CommandHandler("prefs", prefs_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES)

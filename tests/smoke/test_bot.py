@@ -120,7 +120,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         messages = chat_mock.call_args.args[0]
         self.assertIn(SYSTEM_PROMPT, messages[0]["content"])
         self.assertIn("Tone: strict, direct, and disciplined.", messages[0]["content"])
-        self.assertIn("Respond concisely.", messages[0]["content"])
+        self.assertIn("Be concise.", messages[0]["content"])
         self.assertIn("Assume the user's timezone is UTC", messages[0]["content"])
         self.assertEqual(
             messages[1],
@@ -199,7 +199,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(SYSTEM_PROMPT, messages[0]["content"])
         self.assertIn("Tone: casual, conversational, and approachable.", messages[0]["content"])
-        self.assertIn("Respond with detailed, well-structured explanations when useful.", messages[0]["content"])
+        self.assertIn("Give more detail.", messages[0]["content"])
         self.assertEqual(
             messages[1],
             {
@@ -329,7 +329,11 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.set_tone_command(update, context)
 
-        log_tool_mock.assert_awaited_once()
+        log_tool_mock.assert_awaited_once_with(
+            "set_prefs",
+            {"tone": "strict"},
+            {"tone": "strict", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": True},
+        )
         self.assertEqual(
             save_message_mock.call_args_list,
             [
@@ -356,7 +360,11 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.set_verbosity_command(update, context)
 
-        log_tool_mock.assert_awaited_once()
+        log_tool_mock.assert_awaited_once_with(
+            "set_prefs",
+            {"verbosity": "short"},
+            {"tone": "calm", "verbosity": "short", "timezone": "Asia/Kolkata", "executive_mode": True},
+        )
         self.assertEqual(
             save_message_mock.call_args_list,
             [
@@ -383,7 +391,11 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.set_timezone_command(update, context)
 
-        log_tool_mock.assert_awaited_once()
+        log_tool_mock.assert_awaited_once_with(
+            "set_prefs",
+            {"timezone": "UTC"},
+            {"tone": "calm", "verbosity": "medium", "timezone": "UTC", "executive_mode": True},
+        )
         self.assertEqual(
             save_message_mock.call_args_list,
             [
@@ -393,6 +405,37 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         )
         maybe_summarize_mock.assert_awaited_once_with(321)
         update.message.reply_text.assert_awaited_once_with("Timezone set to UTC.")
+
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_exec_mode_command_updates_preferences(self):
+        update = _DummyUpdate("/exec_mode off")
+        context = _DummyContext(args=["off"])
+
+        with (
+            patch(
+                "src.bot.upsert_user_preferences",
+                return_value={"tone": "calm", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": False},
+            ),
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
+            patch("src.bot.save_message") as save_message_mock,
+            patch("src.bot._maybe_summarize", new=AsyncMock()) as maybe_summarize_mock,
+        ):
+            await bot.exec_mode_command(update, context)
+
+        log_tool_mock.assert_awaited_once_with(
+            "set_prefs",
+            {"executive_mode": False},
+            {"tone": "calm", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": False},
+        )
+        self.assertEqual(
+            save_message_mock.call_args_list,
+            [
+                unittest.mock.call(321, "user", "/exec_mode off"),
+                unittest.mock.call(321, "assistant", "Executive mode disabled."),
+            ],
+        )
+        maybe_summarize_mock.assert_awaited_once_with(321)
+        update.message.reply_text.assert_awaited_once_with("Executive mode disabled.")
 
     @patch("src.bot.asyncio.to_thread", new=_run_inline)
     async def test_prefs_command_shows_current_preferences(self):
@@ -416,7 +459,17 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.prefs_command(update, context)
 
-        log_tool_mock.assert_awaited_once()
+        log_tool_mock.assert_awaited_once_with(
+            "get_prefs",
+            {"chat_id": 321},
+            {
+                "ok": True,
+                "tone": "calm",
+                "verbosity": "medium",
+                "timezone": "Asia/Kolkata",
+                "executive_mode": True,
+            },
+        )
         self.assertEqual(
             save_message_mock.call_args_list,
             [
@@ -470,5 +523,5 @@ class BotStartupSmokeTests(unittest.TestCase):
 
         init_db_mock.assert_called_once_with()
         self.assertEqual(fake_builder.token_value, "telegram-token")
-        self.assertEqual(len(fake_app.handlers), 8)
+        self.assertEqual(len(fake_app.handlers), 9)
         fake_app.run_polling.assert_called_once()

@@ -16,6 +16,12 @@ PG_USER = os.getenv("PG_USER", "postgres")
 PG_PASSWORD = os.getenv("PG_PASSWORD", "")
 PG_SCHEMA = os.getenv("PG_SCHEMA", "tinyse")
 ALLOWED_CHAT_ROLES = {"system", "user", "assistant"}
+DEFAULT_USER_PREFERENCES = {
+    "tone": "calm",
+    "verbosity": "medium",
+    "timezone": "Asia/Kolkata",
+    "executive_mode": True,
+}
 
 def _conn():
     if PG_PASSWORD:
@@ -197,28 +203,17 @@ def get_messages_after(chat_id: int, last_message_id: int) -> list[dict]:
 
 
 def get_user_preferences(chat_id: int) -> dict:
-    select_q = f"""
+    q = f"""
     SELECT chat_id, created_at, tone, verbosity, timezone, executive_mode
     FROM {PG_SCHEMA}.user_preferences
     WHERE chat_id = %s;
     """
-    insert_q = f"""
-    INSERT INTO {PG_SCHEMA}.user_preferences(chat_id)
-    VALUES (%s)
-    ON CONFLICT (chat_id) DO NOTHING
-    RETURNING chat_id, created_at, tone, verbosity, timezone, executive_mode;
-    """
     with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(select_q, (int(chat_id),))
+            cur.execute(q, (int(chat_id),))
             row = cur.fetchone()
-            if row is None:
-                cur.execute(insert_q, (int(chat_id),))
-                row = cur.fetchone()
-                if row is None:
-                    cur.execute(select_q, (int(chat_id),))
-                    row = cur.fetchone()
-        conn.commit()
+    if row is None:
+        return {"chat_id": int(chat_id), **DEFAULT_USER_PREFERENCES}
     return row
 
 
