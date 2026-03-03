@@ -108,3 +108,44 @@ class StoreSmokeTests(unittest.TestCase):
         sql, params = cursor.execute.call_args.args
         self.assertIn("chat_messages", sql)
         self.assertEqual(params, (321, 10))
+
+    def test_get_user_preferences_creates_default_row_if_missing(self):
+        conn, cursor = _mock_connection(
+            fetchone=None,
+        )
+        cursor.fetchone.side_effect = [
+            None,
+            {
+                "chat_id": 321,
+                "tone": "calm",
+                "verbosity": "medium",
+                "timezone": "Asia/Kolkata",
+                "executive_mode": True,
+            },
+        ]
+
+        with patch("src.memory.store._conn", return_value=conn):
+            result = store.get_user_preferences(321)
+
+        self.assertEqual(result["tone"], "calm")
+        self.assertEqual(cursor.execute.call_count, 2)
+        conn.commit.assert_called_once_with()
+
+    def test_upsert_user_preferences_updates_requested_fields(self):
+        conn, cursor = _mock_connection(
+            fetchone={
+                "chat_id": 321,
+                "tone": "strict",
+                "verbosity": "medium",
+                "timezone": "Asia/Kolkata",
+                "executive_mode": True,
+            }
+        )
+
+        with patch("src.memory.store._conn", return_value=conn):
+            result = store.upsert_user_preferences(321, {"tone": "strict"})
+
+        self.assertEqual(result["tone"], "strict")
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("user_preferences", sql)
+        self.assertEqual(params, [321, "strict"])

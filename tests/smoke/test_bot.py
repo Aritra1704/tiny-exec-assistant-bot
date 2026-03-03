@@ -99,6 +99,15 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                     "last_message_id_covered": 40,
                 },
             ),
+            patch(
+                "src.bot.get_user_preferences",
+                return_value={
+                    "tone": "strict",
+                    "verbosity": "short",
+                    "timezone": "UTC",
+                    "executive_mode": True,
+                },
+            ),
             patch("src.bot.get_messages_after", return_value=history_rows) as get_messages_after_mock,
             patch("src.bot.chat", return_value="Here is the concise summary.") as chat_mock,
             patch("builtins.print") as print_mock,
@@ -109,7 +118,10 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         get_messages_after_mock.assert_called_once_with(321, 40)
         chat_mock.assert_called_once()
         messages = chat_mock.call_args.args[0]
-        self.assertEqual(messages[0], {"role": "system", "content": SYSTEM_PROMPT})
+        self.assertIn(SYSTEM_PROMPT, messages[0]["content"])
+        self.assertIn("Tone: strict, direct, and disciplined.", messages[0]["content"])
+        self.assertIn("Respond concisely.", messages[0]["content"])
+        self.assertIn("Assume the user's timezone is UTC", messages[0]["content"])
         self.assertEqual(
             messages[1],
             {
@@ -133,6 +145,9 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                 unittest.mock.call(321, "user", "Summarize my day"),
                 unittest.mock.call(321, "assistant", "Here is the concise summary."),
             ],
+        )
+        print_mock.assert_any_call(
+            'loaded preferences for chat_id 321: {"executive_mode": true, "timezone": "UTC", "tone": "strict", "verbosity": "short"}'
         )
         print_mock.assert_any_call("Loaded 15 previous messages for chat_id 321")
         maybe_summarize_mock.assert_awaited_once_with(321)
@@ -174,9 +189,17 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                 {"role": "user", "content": long_content},
             ],
             summary_text="Decisions and commitments so far.",
+            preferences={
+                "tone": "casual",
+                "verbosity": "detailed",
+                "timezone": "America/New_York",
+                "executive_mode": False,
+            },
         )
 
-        self.assertEqual(messages[0], {"role": "system", "content": SYSTEM_PROMPT})
+        self.assertIn(SYSTEM_PROMPT, messages[0]["content"])
+        self.assertIn("Tone: casual, conversational, and approachable.", messages[0]["content"])
+        self.assertIn("Respond with detailed, well-structured explanations when useful.", messages[0]["content"])
         self.assertEqual(
             messages[1],
             {
@@ -290,6 +313,126 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
             "Done. I'll remind you at 2026-03-02T10:15:00+00:00."
         )
 
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_set_tone_command_updates_preferences(self):
+        update = _DummyUpdate("/set_tone strict")
+        context = _DummyContext(args=["strict"])
+
+        with (
+            patch(
+                "src.bot.upsert_user_preferences",
+                return_value={"tone": "strict", "verbosity": "medium", "timezone": "Asia/Kolkata", "executive_mode": True},
+            ),
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
+            patch("src.bot.save_message") as save_message_mock,
+            patch("src.bot._maybe_summarize", new=AsyncMock()) as maybe_summarize_mock,
+        ):
+            await bot.set_tone_command(update, context)
+
+        log_tool_mock.assert_awaited_once()
+        self.assertEqual(
+            save_message_mock.call_args_list,
+            [
+                unittest.mock.call(321, "user", "/set_tone strict"),
+                unittest.mock.call(321, "assistant", "Tone set to strict."),
+            ],
+        )
+        maybe_summarize_mock.assert_awaited_once_with(321)
+        update.message.reply_text.assert_awaited_once_with("Tone set to strict.")
+
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_set_verbosity_command_updates_preferences(self):
+        update = _DummyUpdate("/set_verbosity short")
+        context = _DummyContext(args=["short"])
+
+        with (
+            patch(
+                "src.bot.upsert_user_preferences",
+                return_value={"tone": "calm", "verbosity": "short", "timezone": "Asia/Kolkata", "executive_mode": True},
+            ),
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
+            patch("src.bot.save_message") as save_message_mock,
+            patch("src.bot._maybe_summarize", new=AsyncMock()) as maybe_summarize_mock,
+        ):
+            await bot.set_verbosity_command(update, context)
+
+        log_tool_mock.assert_awaited_once()
+        self.assertEqual(
+            save_message_mock.call_args_list,
+            [
+                unittest.mock.call(321, "user", "/set_verbosity short"),
+                unittest.mock.call(321, "assistant", "Verbosity set to short."),
+            ],
+        )
+        maybe_summarize_mock.assert_awaited_once_with(321)
+        update.message.reply_text.assert_awaited_once_with("Verbosity set to short.")
+
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_set_timezone_command_updates_preferences(self):
+        update = _DummyUpdate("/set_timezone UTC")
+        context = _DummyContext(args=["UTC"])
+
+        with (
+            patch(
+                "src.bot.upsert_user_preferences",
+                return_value={"tone": "calm", "verbosity": "medium", "timezone": "UTC", "executive_mode": True},
+            ),
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
+            patch("src.bot.save_message") as save_message_mock,
+            patch("src.bot._maybe_summarize", new=AsyncMock()) as maybe_summarize_mock,
+        ):
+            await bot.set_timezone_command(update, context)
+
+        log_tool_mock.assert_awaited_once()
+        self.assertEqual(
+            save_message_mock.call_args_list,
+            [
+                unittest.mock.call(321, "user", "/set_timezone UTC"),
+                unittest.mock.call(321, "assistant", "Timezone set to UTC."),
+            ],
+        )
+        maybe_summarize_mock.assert_awaited_once_with(321)
+        update.message.reply_text.assert_awaited_once_with("Timezone set to UTC.")
+
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_prefs_command_shows_current_preferences(self):
+        update = _DummyUpdate("/prefs")
+        context = _DummyContext()
+
+        with (
+            patch(
+                "src.bot.get_user_preferences",
+                return_value={
+                    "tone": "calm",
+                    "verbosity": "medium",
+                    "timezone": "Asia/Kolkata",
+                    "executive_mode": True,
+                },
+            ),
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
+            patch("src.bot.save_message") as save_message_mock,
+            patch("src.bot._maybe_summarize", new=AsyncMock()) as maybe_summarize_mock,
+            patch("builtins.print"),
+        ):
+            await bot.prefs_command(update, context)
+
+        log_tool_mock.assert_awaited_once()
+        self.assertEqual(
+            save_message_mock.call_args_list,
+            [
+                unittest.mock.call(321, "user", "/prefs"),
+                unittest.mock.call(
+                    321,
+                    "assistant",
+                    "Current preferences:\ntone=calm\nverbosity=medium\ntimezone=Asia/Kolkata\nexecutive_mode=True",
+                ),
+            ],
+        )
+        maybe_summarize_mock.assert_awaited_once_with(321)
+        update.message.reply_text.assert_awaited_once_with(
+            "Current preferences:\ntone=calm\nverbosity=medium\ntimezone=Asia/Kolkata\nexecutive_mode=True"
+        )
+
 
 class _FakeApp:
     def __init__(self):
@@ -327,5 +470,5 @@ class BotStartupSmokeTests(unittest.TestCase):
 
         init_db_mock.assert_called_once_with()
         self.assertEqual(fake_builder.token_value, "telegram-token")
-        self.assertEqual(len(fake_app.handlers), 4)
+        self.assertEqual(len(fake_app.handlers), 8)
         fake_app.run_polling.assert_called_once()

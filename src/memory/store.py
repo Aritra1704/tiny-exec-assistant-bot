@@ -61,6 +61,15 @@ def init_db():
       summary_text TEXT NOT NULL,
       last_message_id_covered BIGINT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.user_preferences (
+      chat_id BIGINT PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      tone TEXT DEFAULT 'calm',
+      verbosity TEXT DEFAULT 'medium',
+      timezone TEXT DEFAULT 'Asia/Kolkata',
+      executive_mode BOOLEAN DEFAULT true
+    );
     """
     with _conn() as conn:
         with conn.cursor() as cur:
@@ -185,3 +194,54 @@ def get_messages_after(chat_id: int, last_message_id: int) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(q, (int(chat_id), int(last_message_id)))
             return cur.fetchall()
+
+
+def get_user_preferences(chat_id: int) -> dict:
+    select_q = f"""
+    SELECT chat_id, created_at, tone, verbosity, timezone, executive_mode
+    FROM {PG_SCHEMA}.user_preferences
+    WHERE chat_id = %s;
+    """
+    insert_q = f"""
+    INSERT INTO {PG_SCHEMA}.user_preferences(chat_id)
+    VALUES (%s)
+    ON CONFLICT (chat_id) DO NOTHING
+    RETURNING chat_id, created_at, tone, verbosity, timezone, executive_mode;
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(select_q, (int(chat_id),))
+            row = cur.fetchone()
+            if row is None:
+                cur.execute(insert_q, (int(chat_id),))
+                row = cur.fetchone()
+                if row is None:
+                    cur.execute(select_q, (int(chat_id),))
+                    row = cur.fetchone()
+        conn.commit()
+    return row
+
+
+def upsert_user_preferences(chat_id: int, fields_dict: dict) -> dict:
+    allowed_fields = {"tone", "verbosity", "timezone", "executive_mode"}
+    updates = {key: value for key, value in fields_dict.items() if key in allowed_fields}
+    if not updates:
+        return get_user_preferences(chat_id)
+
+    columns = ", ".join(updates.keys())
+    placeholders = ", ".join(["%s"] * len(updates))
+    assignments = ", ".join(f"{column} = EXCLUDED.{column}" for column in updates.keys())
+    q = f"""
+    INSERT INTO {PG_SCHEMA}.user_preferences(chat_id, {columns})
+    VALUES (%s, {placeholders})
+    ON CONFLICT (chat_id) DO UPDATE
+    SET {assignments}
+    RETURNING chat_id, created_at, tone, verbosity, timezone, executive_mode;
+    """
+    params = [int(chat_id), *updates.values()]
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, params)
+            row = cur.fetchone()
+        conn.commit()
+    return row

@@ -18,9 +18,11 @@ from src.llm import chat
 from src.memory.store import (
     get_last_summary,
     get_messages_after,
+    get_user_preferences,
     init_db,
     log_tool,
     save_message,
+    upsert_user_preferences,
 )
 from src.memory.summarizer import maybe_summarize
 from src.prompt import SYSTEM_PROMPT
@@ -34,6 +36,56 @@ CHAT_HISTORY_LIMIT = 20
 DETAILED_HISTORY_LIMIT = 15
 CHAT_CONTEXT_CHAR_LIMIT = max(200, min(int(os.getenv("CHAT_CONTEXT_CHAR_LIMIT", "1200")), 4000))
 DEBUG_TEXT_LIMIT = 80
+VALID_TONES = {"calm", "strict", "casual"}
+VALID_VERBOSITY = {"short", "medium", "detailed"}
+
+
+def _normalize_preferences(preferences: dict | None) -> dict:
+    base = {
+        "tone": "calm",
+        "verbosity": "medium",
+        "timezone": "Asia/Kolkata",
+        "executive_mode": True,
+    }
+    if preferences:
+        base.update(
+            {
+                "tone": preferences.get("tone", base["tone"]),
+                "verbosity": preferences.get("verbosity", base["verbosity"]),
+                "timezone": preferences.get("timezone", base["timezone"]),
+                "executive_mode": bool(preferences.get("executive_mode", base["executive_mode"])),
+            }
+        )
+    return base
+
+
+def _build_dynamic_system_prompt(preferences: dict | None) -> str:
+    normalized = _normalize_preferences(preferences)
+    additions = [SYSTEM_PROMPT]
+
+    tone = normalized["tone"]
+    if tone == "strict":
+        additions.append("Tone: strict, direct, and disciplined.")
+    elif tone == "casual":
+        additions.append("Tone: casual, conversational, and approachable.")
+    else:
+        additions.append("Tone: calm, steady, and practical.")
+
+    verbosity = normalized["verbosity"]
+    if verbosity == "short":
+        additions.append("Respond concisely.")
+    elif verbosity == "detailed":
+        additions.append("Respond with detailed, well-structured explanations when useful.")
+    else:
+        additions.append("Keep responses medium length unless more detail is necessary.")
+
+    if normalized["executive_mode"]:
+        additions.append("Maintain an executive assistant mindset and prioritize decisions, tasks, and outcomes.")
+    else:
+        additions.append("Do not force executive assistant phrasing unless the user asks for it.")
+
+    additions.append(f"Assume the user's timezone is {normalized['timezone']} when time context matters.")
+    return "\n\n".join(additions)
 
 
 def _execute_tool(tool: str, args: dict, send_fn, chat_id: int) -> dict:
@@ -87,8 +139,12 @@ def _trim_content_for_context(content: str) -> str:
     return cleaned_content[: CHAT_CONTEXT_CHAR_LIMIT - 3].rstrip() + "..."
 
 
-def _build_chat_context(history_rows: list[dict], summary_text: str | None = None) -> list[dict]:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+def _build_chat_context(
+    history_rows: list[dict],
+    summary_text: str | None = None,
+    preferences: dict | None = None,
+) -> list[dict]:
+    messages = [{"role": "system", "content": _build_dynamic_system_prompt(preferences)}]
     if summary_text:
         messages.append(
             {
@@ -120,6 +176,17 @@ async def _maybe_summarize(chat_id: int) -> None:
         await asyncio.to_thread(maybe_summarize, chat_id)
     except Exception as exc:
         print(f"summarization failed for chat_id {chat_id}: {type(exc).__name__}")
+
+
+async def _get_preferences(chat_id: int) -> dict:
+    try:
+        preferences = await asyncio.to_thread(get_user_preferences, chat_id)
+        normalized = _normalize_preferences(preferences)
+        print(f"loaded preferences for chat_id {chat_id}: {json.dumps(normalized, sort_keys=True)}")
+        return normalized
+    except Exception as exc:
+        print(f"preferences load failed for chat_id {chat_id}: {type(exc).__name__}")
+        return _normalize_preferences(None)
 
 
 async def _get_chat_history(chat_id: int) -> tuple[str | None, list[dict]]:
@@ -166,6 +233,36 @@ async def _log_tool_result(tool: str, args: dict, result: dict) -> None:
         print("tool logged to postgres")
     except Exception as exc:
         print(f"log_tool failed for {tool}: {type(exc).__name__}")
+
+
+async def _run_preference_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tool: str,
+    fields: dict,
+    reply_text: str | None = None,
+) -> None:
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    try:
+        result = await asyncio.to_thread(upsert_user_preferences, chat_id, fields)
+        await _log_tool_result(tool, fields, result)
+        preferences = _normalize_preferences(result)
+        reply = reply_text or (
+            "Preferences updated:\n"
+            f"tone={preferences['tone']}\n"
+            f"verbosity={preferences['verbosity']}\n"
+            f"timezone={preferences['timezone']}\n"
+            f"executive_mode={preferences['executive_mode']}"
+        )
+    except Exception as exc:
+        reply = f"Couldn’t update preferences: {type(exc).__name__}"
+
+    await update.message.reply_text(reply)
+    await _save_chat_message(chat_id, "assistant", reply)
+    await _maybe_summarize(chat_id)
 
 
 def _format_command_reply(tool: str, result: dict) -> str:
@@ -218,6 +315,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f'incoming message chat_id={chat_id} user_text="{_truncate_for_debug(user_text)}"'
     )
     await _save_chat_message(chat_id, "user", user_text)
+    preferences = await _get_preferences(chat_id)
 
     decision = await asyncio.to_thread(decide, user_text)
     print(f'router decision type="{decision["type"]}"')
@@ -236,7 +334,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = decision["text"]
     else:
         summary_text, history_rows = await _get_chat_history(chat_id)
-        messages = _build_chat_context(history_rows, summary_text=summary_text)
+        messages = _build_chat_context(
+            history_rows,
+            summary_text=summary_text,
+            preferences=preferences,
+        )
         reply = await asyncio.to_thread(chat, messages)
 
     await update.message.reply_text(reply)
@@ -324,6 +426,108 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _maybe_summarize(chat_id)
 
 
+async def set_tone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f"CMD /set_tone args={json.dumps(context.args)}")
+    await _save_chat_message(chat_id, "user", user_text)
+
+    tone = (context.args[0].strip().lower() if context.args else "")
+    if tone not in VALID_TONES:
+        reply = "Use /set_tone calm, /set_tone strict, or /set_tone casual."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        await _maybe_summarize(chat_id)
+        return
+
+    await _run_preference_command(
+        update,
+        context,
+        "set_tone",
+        {"tone": tone},
+        reply_text=f"Tone set to {tone}.",
+    )
+
+
+async def set_verbosity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f"CMD /set_verbosity args={json.dumps(context.args)}")
+    await _save_chat_message(chat_id, "user", user_text)
+
+    verbosity = (context.args[0].strip().lower() if context.args else "")
+    if verbosity not in VALID_VERBOSITY:
+        reply = "Use /set_verbosity short, /set_verbosity medium, or /set_verbosity detailed."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        await _maybe_summarize(chat_id)
+        return
+
+    await _run_preference_command(
+        update,
+        context,
+        "set_verbosity",
+        {"verbosity": verbosity},
+        reply_text=f"Verbosity set to {verbosity}.",
+    )
+
+
+async def set_timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f"CMD /set_timezone args={json.dumps(context.args)}")
+    await _save_chat_message(chat_id, "user", user_text)
+
+    timezone_value = " ".join(context.args).strip()
+    if not timezone_value:
+        reply = "Use /set_timezone <tz>."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        await _maybe_summarize(chat_id)
+        return
+
+    await _run_preference_command(
+        update,
+        context,
+        "set_timezone",
+        {"timezone": timezone_value},
+        reply_text=f"Timezone set to {timezone_value}.",
+    )
+
+
+async def prefs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print("CMD /prefs args=[]")
+    await _save_chat_message(chat_id, "user", user_text)
+
+    preferences = await _get_preferences(chat_id)
+    result = {"ok": True, **preferences}
+    await _log_tool_result("show_preferences", {"chat_id": chat_id}, result)
+    reply = (
+        "Current preferences:\n"
+        f"tone={preferences['tone']}\n"
+        f"verbosity={preferences['verbosity']}\n"
+        f"timezone={preferences['timezone']}\n"
+        f"executive_mode={preferences['executive_mode']}"
+    )
+    await update.message.reply_text(reply)
+    await _save_chat_message(chat_id, "assistant", reply)
+    await _maybe_summarize(chat_id)
+
+
 def main():
     init_db()
 
@@ -335,6 +539,10 @@ def main():
     app.add_handler(CommandHandler("note", note_command))
     app.add_handler(CommandHandler("notes", notes_command))
     app.add_handler(CommandHandler("remind", remind_command))
+    app.add_handler(CommandHandler("set_tone", set_tone_command))
+    app.add_handler(CommandHandler("set_verbosity", set_verbosity_command))
+    app.add_handler(CommandHandler("set_timezone", set_timezone_command))
+    app.add_handler(CommandHandler("prefs", prefs_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
