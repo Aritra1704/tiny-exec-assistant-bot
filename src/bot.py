@@ -567,6 +567,7 @@ def main():
     app.add_handler(CommandHandler("exec_mode", exec_mode_command))
     app.add_handler(CommandHandler("prefs", prefs_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    print("tinySe is running ✅ (polling started)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
