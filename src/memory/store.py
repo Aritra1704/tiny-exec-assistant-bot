@@ -5,6 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import psycopg
 from psycopg.rows import dict_row
+from src.embeddings import OLLAMA_EMBED_MODEL, embed_text
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -23,6 +24,38 @@ DEFAULT_USER_PREFERENCES = {
     "executive_mode": True,
 }
 
+
+def _vector_literal(values: list[float]) -> str:
+    return "[" + ",".join(f"{float(value):.12g}" for value in values) + "]"
+
+
+def _get_embedding_dim() -> int:
+    q = f"""
+    SELECT dim
+    FROM {PG_SCHEMA}.embedding_meta
+    WHERE model = %s;
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (OLLAMA_EMBED_MODEL,))
+            row = cur.fetchone()
+            if row is not None:
+                return int(row["dim"])
+
+            dim = len(embed_text("dimension check"))
+            cur.execute(
+                f"""
+                INSERT INTO {PG_SCHEMA}.embedding_meta(model, dim)
+                VALUES (%s, %s)
+                ON CONFLICT (model) DO UPDATE SET dim = EXCLUDED.dim
+                RETURNING dim;
+                """,
+                (OLLAMA_EMBED_MODEL, dim),
+            )
+            stored = cur.fetchone()
+        conn.commit()
+    return int(stored["dim"])
+
 def _conn():
     if PG_PASSWORD:
         conninfo = (
@@ -36,6 +69,7 @@ def _conn():
 
 def init_db():
     ddl = f"""
+    CREATE EXTENSION IF NOT EXISTS vector;
     CREATE SCHEMA IF NOT EXISTS {PG_SCHEMA};
 
     CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.notes (
@@ -76,10 +110,47 @@ def init_db():
       timezone TEXT DEFAULT 'Asia/Kolkata',
       executive_mode BOOLEAN DEFAULT true
     );
+
+    CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.embedding_meta (
+      model TEXT PRIMARY KEY,
+      dim INT NOT NULL
+    );
     """
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(ddl)
+        conn.commit()
+
+    embedding_dim = _get_embedding_dim()
+    embedding_ddl = f"""
+    CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.message_embeddings (
+      id BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      chat_id BIGINT NOT NULL,
+      message_id BIGINT NOT NULL,
+      content TEXT NOT NULL,
+      embedding vector({embedding_dim}) NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS message_embeddings_chat_id_idx
+    ON {PG_SCHEMA}.message_embeddings(chat_id);
+
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'message_embeddings_chat_id_message_id_key'
+      ) THEN
+        ALTER TABLE {PG_SCHEMA}.message_embeddings
+        ADD CONSTRAINT message_embeddings_chat_id_message_id_key
+        UNIQUE (chat_id, message_id);
+      END IF;
+    END $$;
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(embedding_ddl)
         conn.commit()
 
 def add_note(text: str) -> int:
@@ -240,3 +311,46 @@ def upsert_user_preferences(chat_id: int, fields_dict: dict) -> dict:
             row = cur.fetchone()
         conn.commit()
     return row
+
+
+def save_message_embedding(
+    chat_id: int,
+    message_id: int,
+    content: str,
+    embedding: list[float],
+) -> int:
+    q = f"""
+    INSERT INTO {PG_SCHEMA}.message_embeddings(chat_id, message_id, content, embedding)
+    VALUES (%s, %s, %s, %s::vector)
+    ON CONFLICT (chat_id, message_id) DO UPDATE
+    SET content = EXCLUDED.content,
+        embedding = EXCLUDED.embedding
+    RETURNING id;
+    """
+    vector_value = _vector_literal(embedding)
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (int(chat_id), int(message_id), content.strip(), vector_value))
+            row = cur.fetchone()
+        conn.commit()
+    return int(row["id"])
+
+
+def search_similar_messages(
+    chat_id: int,
+    query_embedding: list[float],
+    top_k: int = 5,
+) -> list[dict]:
+    safe_top_k = max(1, min(int(top_k), 20))
+    vector_value = _vector_literal(query_embedding)
+    q = f"""
+    SELECT message_id, content, embedding <=> %s::vector AS distance
+    FROM {PG_SCHEMA}.message_embeddings
+    WHERE chat_id = %s
+    ORDER BY embedding <=> %s::vector
+    LIMIT %s;
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (vector_value, int(chat_id), vector_value, safe_top_k))
+            return cur.fetchall()

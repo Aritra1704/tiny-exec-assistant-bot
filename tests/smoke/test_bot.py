@@ -108,6 +108,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                     "executive_mode": True,
                 },
             ),
+            patch("src.bot._get_relevant_memory", new=AsyncMock(return_value=["Discussed payroll cutoff."])) as relevant_memory_mock,
             patch("src.bot.get_messages_after", return_value=history_rows) as get_messages_after_mock,
             patch("src.bot.chat", return_value="Here is the concise summary.") as chat_mock,
             patch("builtins.print") as print_mock,
@@ -116,6 +117,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
             await bot.on_message(update, context)
 
         get_messages_after_mock.assert_called_once_with(321, 40)
+        relevant_memory_mock.assert_awaited_once()
         chat_mock.assert_called_once()
         messages = chat_mock.call_args.args[0]
         self.assertIn(SYSTEM_PROMPT, messages[0]["content"])
@@ -130,7 +132,14 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(
-            messages[2:],
+            messages[2],
+            {
+                "role": "system",
+                "content": "Relevant memory (semantic):\n- Discussed payroll cutoff.",
+            },
+        )
+        self.assertEqual(
+            messages[3:],
             [
                 {
                     "role": row["role"],
@@ -180,7 +189,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         maybe_summarize_mock.assert_awaited_once_with(321)
         update.message.reply_text.assert_awaited_once_with("In how many minutes?")
 
-    def test_build_chat_context_includes_summary_and_trims_large_messages(self):
+    def test_build_chat_context_includes_summary_memory_and_trims_large_messages(self):
         long_content = "x" * (bot.CHAT_CONTEXT_CHAR_LIMIT + 25)
 
         messages = bot._build_chat_context(
@@ -195,6 +204,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                 "timezone": "America/New_York",
                 "executive_mode": False,
             },
+            relevant_memory=["Discussed quarterly staffing."],
         )
 
         self.assertIn(SYSTEM_PROMPT, messages[0]["content"])
@@ -207,9 +217,55 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
                 "content": "Conversation summary so far: Decisions and commitments so far.",
             },
         )
-        self.assertEqual(messages[2], {"role": "assistant", "content": "Short reply"})
-        self.assertEqual(len(messages[3]["content"]), bot.CHAT_CONTEXT_CHAR_LIMIT)
-        self.assertTrue(messages[3]["content"].endswith("..."))
+        self.assertEqual(
+            messages[2],
+            {
+                "role": "system",
+                "content": "Relevant memory (semantic):\n- Discussed quarterly staffing.",
+            },
+        )
+        self.assertEqual(messages[3], {"role": "assistant", "content": "Short reply"})
+        self.assertEqual(len(messages[4]["content"]), bot.CHAT_CONTEXT_CHAR_LIMIT)
+        self.assertTrue(messages[4]["content"].endswith("..."))
+
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_save_chat_message_also_saves_embedding_for_natural_language(self):
+        with (
+            patch("src.bot.save_message", return_value=55) as save_message_mock,
+            patch("src.bot._save_message_embedding", new=AsyncMock()) as save_embedding_mock,
+        ):
+            message_id = await bot._save_chat_message(321, "user", "hello")
+
+        self.assertEqual(message_id, 55)
+        save_message_mock.assert_called_once_with(321, "user", "hello")
+        save_embedding_mock.assert_awaited_once_with(321, 55, "hello")
+
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_get_relevant_memory_filters_current_message_and_logs_hits(self):
+        with (
+            patch("src.bot.embed_text", return_value=[0.1, 0.2]),
+            patch(
+                "src.bot.search_similar_messages",
+                return_value=[
+                    {"message_id": 7, "content": "current question", "distance": 0.0},
+                    {"message_id": 5, "content": "Remember payroll deadline", "distance": 0.1},
+                    {"message_id": 6, "content": "Remember payroll deadline", "distance": 0.2},
+                    {"message_id": 4, "content": "Budget review is tomorrow", "distance": 0.3},
+                ],
+            ),
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
+        ):
+            snippets = await bot._get_relevant_memory(321, "What is due tomorrow?", 7)
+
+        self.assertEqual(
+            snippets,
+            ["Remember payroll deadline", "Budget review is tomorrow"],
+        )
+        log_tool_mock.assert_awaited_once_with(
+            "semantic_retrieval",
+            {"chat_id": 321, "top_k": bot.RAG_TOP_K},
+            {"hits": 2},
+        )
 
     @patch("src.bot.asyncio.to_thread", new=_run_inline)
     async def test_note_command_runs_save_note_tool(self):

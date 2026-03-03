@@ -140,3 +140,26 @@ class StoreSmokeTests(unittest.TestCase):
         sql, params = cursor.execute.call_args.args
         self.assertIn("user_preferences", sql)
         self.assertEqual(params, [321, "strict"])
+
+    def test_save_message_embedding_upserts_vector_row(self):
+        conn, cursor = _mock_connection(fetchone={"id": 77})
+
+        with patch("src.memory.store._conn", return_value=conn):
+            embedding_id = store.save_message_embedding(321, 9, "hello", [0.1, 0.2])
+
+        self.assertEqual(embedding_id, 77)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("message_embeddings", sql)
+        self.assertEqual(params, (321, 9, "hello", "[0.1,0.2]"))
+
+    def test_search_similar_messages_returns_hits(self):
+        rows = [{"message_id": 9, "content": "hello", "distance": 0.12}]
+        conn, cursor = _mock_connection(fetchall=rows)
+
+        with patch("src.memory.store._conn", return_value=conn):
+            result = store.search_similar_messages(321, [0.1, 0.2], top_k=5)
+
+        self.assertEqual(result, rows)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("message_embeddings", sql)
+        self.assertEqual(params, ("[0.1,0.2]", 321, "[0.1,0.2]", 5))

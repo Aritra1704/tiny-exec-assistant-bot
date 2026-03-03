@@ -14,6 +14,7 @@ from telegram.ext import (
     filters,
 )
 
+from src.embeddings import embed_text
 from src.llm import chat
 from src.memory.store import (
     get_last_summary,
@@ -21,7 +22,9 @@ from src.memory.store import (
     get_user_preferences,
     init_db,
     log_tool,
+    save_message_embedding,
     save_message,
+    search_similar_messages,
     upsert_user_preferences,
 )
 from src.memory.summarizer import maybe_summarize
@@ -36,6 +39,7 @@ CHAT_HISTORY_LIMIT = 20
 DETAILED_HISTORY_LIMIT = 15
 CHAT_CONTEXT_CHAR_LIMIT = max(200, min(int(os.getenv("CHAT_CONTEXT_CHAR_LIMIT", "1200")), 4000))
 DEBUG_TEXT_LIMIT = 80
+RAG_TOP_K = max(1, min(int(os.getenv("RAG_TOP_K", "5")), 10))
 VALID_TONES = {"calm", "strict", "casual"}
 VALID_VERBOSITY = {"short", "medium", "detailed"}
 
@@ -139,10 +143,18 @@ def _trim_content_for_context(content: str) -> str:
     return cleaned_content[: CHAT_CONTEXT_CHAR_LIMIT - 3].rstrip() + "..."
 
 
+def _trim_relevant_memory(content: str) -> str:
+    trimmed_content = _trim_content_for_context(content)
+    if len(trimmed_content) <= 180:
+        return trimmed_content
+    return trimmed_content[:177].rstrip() + "..."
+
+
 def _build_chat_context(
     history_rows: list[dict],
     summary_text: str | None = None,
     preferences: dict | None = None,
+    relevant_memory: list[str] | None = None,
 ) -> list[dict]:
     messages = [{"role": "system", "content": _build_dynamic_system_prompt(preferences)}]
     if summary_text:
@@ -150,6 +162,14 @@ def _build_chat_context(
             {
                 "role": "system",
                 "content": f"Conversation summary so far: {summary_text.strip()}",
+            }
+        )
+    if relevant_memory:
+        messages.append(
+            {
+                "role": "system",
+                "content": "Relevant memory (semantic):\n"
+                + "\n".join(f"- {snippet}" for snippet in relevant_memory),
             }
         )
     for row in history_rows:
@@ -164,11 +184,30 @@ def _build_chat_context(
     return messages
 
 
-async def _save_chat_message(chat_id: int, role: str, content: str) -> None:
+async def _save_message_embedding(chat_id: int, message_id: int, content: str) -> None:
     try:
-        await asyncio.to_thread(save_message, chat_id, role, content)
+        embedding = await asyncio.to_thread(embed_text, content)
+        await asyncio.to_thread(
+            save_message_embedding,
+            chat_id,
+            message_id,
+            content,
+            embedding,
+        )
+    except Exception as exc:
+        print(f"embedding save failed for chat_id {chat_id}: {type(exc).__name__}")
+
+
+async def _save_chat_message(chat_id: int, role: str, content: str) -> int | None:
+    try:
+        message_id = await asyncio.to_thread(save_message, chat_id, role, content)
     except Exception as exc:
         print(f"chat memory save failed for role={role}: {type(exc).__name__}")
+        return None
+
+    if role in {"user", "assistant"} and isinstance(message_id, int):
+        await _save_message_embedding(chat_id, message_id, content)
+    return message_id
 
 
 async def _maybe_summarize(chat_id: int) -> None:
@@ -203,6 +242,49 @@ async def _get_chat_history(chat_id: int) -> tuple[str | None, list[dict]]:
     except Exception as exc:
         print(f"chat memory load failed: {type(exc).__name__}")
         return None, []
+
+
+async def _get_relevant_memory(
+    chat_id: int,
+    user_text: str,
+    current_message_id: int | None,
+) -> list[str]:
+    try:
+        query_embedding = await asyncio.to_thread(embed_text, user_text)
+        raw_hits = await asyncio.to_thread(
+            search_similar_messages,
+            chat_id,
+            query_embedding,
+            RAG_TOP_K + 3,
+        )
+        snippets = []
+        seen = set()
+        for hit in raw_hits:
+            if current_message_id is not None and int(hit.get("message_id", 0)) == current_message_id:
+                continue
+
+            snippet = _trim_relevant_memory(str(hit.get("content", "")))
+            if not snippet:
+                continue
+
+            dedupe_key = snippet.lower()
+            if dedupe_key in seen:
+                continue
+
+            seen.add(dedupe_key)
+            snippets.append(snippet)
+            if len(snippets) == RAG_TOP_K:
+                break
+
+        await _log_tool_result(
+            "semantic_retrieval",
+            {"chat_id": chat_id, "top_k": RAG_TOP_K},
+            {"hits": len(snippets)},
+        )
+        return snippets
+    except Exception as exc:
+        print(f"semantic retrieval failed for chat_id {chat_id}: {type(exc).__name__}")
+        return []
 
 
 def _make_send_telegram(context: ContextTypes.DEFAULT_TYPE) -> Callable[[int, str], None]:
@@ -313,7 +395,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(
         f'incoming message chat_id={chat_id} user_text="{_truncate_for_debug(user_text)}"'
     )
-    await _save_chat_message(chat_id, "user", user_text)
+    user_message_id = await _save_chat_message(chat_id, "user", user_text)
     preferences = await _get_preferences(chat_id)
 
     decision = await asyncio.to_thread(decide, user_text)
@@ -333,10 +415,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = decision["text"]
     else:
         summary_text, history_rows = await _get_chat_history(chat_id)
+        relevant_memory = await _get_relevant_memory(chat_id, user_text, user_message_id)
         messages = _build_chat_context(
             history_rows,
             summary_text=summary_text,
             preferences=preferences,
+            relevant_memory=relevant_memory,
         )
         reply = await asyncio.to_thread(chat, messages)
 
