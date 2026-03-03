@@ -150,6 +150,19 @@ def _trim_relevant_memory(content: str) -> str:
     return trimmed_content[:177].rstrip() + "..."
 
 
+def _format_memory_hits(hits: list[dict]) -> str:
+    if not hits:
+        return "No semantic matches found."
+
+    lines = []
+    for index, hit in enumerate(hits, start=1):
+        snippet = _trim_relevant_memory(str(hit.get("content", "")))
+        distance = float(hit.get("distance", 0.0))
+        score = max(0.0, 1.0 - distance)
+        lines.append(f"{index}. score={score:.3f} dist={distance:.3f} {snippet}")
+    return "\n".join(lines)
+
+
 def _build_chat_context(
     history_rows: list[dict],
     summary_text: str | None = None,
@@ -634,6 +647,49 @@ async def prefs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _maybe_summarize(chat_id)
 
 
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print(f"CMD /memory args={json.dumps(context.args)}")
+    user_message_id = await _save_chat_message(chat_id, "user", user_text)
+
+    query = " ".join(context.args).strip()
+    if not query:
+        reply = "Use /memory <query>."
+        await update.message.reply_text(reply)
+        await _save_chat_message(chat_id, "assistant", reply)
+        await _maybe_summarize(chat_id)
+        return
+
+    try:
+        query_embedding = await asyncio.to_thread(embed_text, query)
+        raw_hits = await asyncio.to_thread(search_similar_messages, chat_id, query_embedding, 5 + 1)
+        hits = []
+        for hit in raw_hits:
+            if user_message_id is not None and int(hit.get("message_id", 0)) == user_message_id:
+                continue
+            hits.append(hit)
+            if len(hits) == 5:
+                break
+
+        result = {"hits": len(hits)}
+        await _log_tool_result(
+            "memory_inspect",
+            {"chat_id": chat_id, "query": query, "top_k": 5},
+            result,
+        )
+        reply = _format_memory_hits(hits)
+    except Exception as exc:
+        reply = f"Couldn’t inspect memory: {type(exc).__name__}"
+
+    await update.message.reply_text(reply)
+    await _save_chat_message(chat_id, "assistant", reply)
+    await _maybe_summarize(chat_id)
+
+
 def main():
     init_db()
 
@@ -650,6 +706,7 @@ def main():
     app.add_handler(CommandHandler("set_timezone", set_timezone_command))
     app.add_handler(CommandHandler("exec_mode", exec_mode_command))
     app.add_handler(CommandHandler("prefs", prefs_command))
+    app.add_handler(CommandHandler("memory", memory_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     print("tinySe is running ✅ (polling started)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

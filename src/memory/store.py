@@ -354,3 +354,31 @@ def search_similar_messages(
         with conn.cursor() as cur:
             cur.execute(q, (vector_value, int(chat_id), vector_value, safe_top_k))
             return cur.fetchall()
+
+
+def embedding_exists(chat_id: int, message_id: int) -> bool:
+    q = f"""
+    SELECT 1
+    FROM {PG_SCHEMA}.message_embeddings
+    WHERE chat_id = %s AND message_id = %s
+    LIMIT 1;
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (int(chat_id), int(message_id)))
+            return cur.fetchone() is not None
+
+
+def iter_chat_messages(after_id: int = 0, batch_size: int = 100) -> list[dict]:
+    safe_batch_size = max(1, min(int(batch_size), 1000))
+    q = f"""
+    SELECT id, chat_id, role, content
+    FROM {PG_SCHEMA}.chat_messages
+    WHERE id > %s
+    ORDER BY id ASC
+    LIMIT %s;
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (int(after_id), safe_batch_size))
+            return cur.fetchall()

@@ -542,6 +542,40 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
             "Current preferences:\ntone=calm\nverbosity=medium\ntimezone=Asia/Kolkata\nexecutive_mode=True"
         )
 
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_memory_command_returns_ranked_hits_and_logs(self):
+        update = _DummyUpdate("/memory supplier invoices")
+        context = _DummyContext(args=["supplier", "invoices"])
+
+        with (
+            patch("src.bot._save_chat_message", new=AsyncMock(side_effect=[88, None])) as save_chat_message_mock,
+            patch("src.bot.embed_text", return_value=[0.1, 0.2]),
+            patch(
+                "src.bot.search_similar_messages",
+                return_value=[
+                    {"message_id": 88, "content": "/memory supplier invoices", "distance": 0.0},
+                    {"message_id": 10, "content": "Neha handles vendor invoices.", "distance": 0.12},
+                    {"message_id": 11, "content": "Accounts payable closes Friday.", "distance": 0.31},
+                ],
+            ) as search_mock,
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
+            patch("src.bot._maybe_summarize", new=AsyncMock()) as maybe_summarize_mock,
+        ):
+            await bot.memory_command(update, context)
+
+        search_mock.assert_called_once_with(321, [0.1, 0.2], 6)
+        log_tool_mock.assert_awaited_once_with(
+            "memory_inspect",
+            {"chat_id": 321, "query": "supplier invoices", "top_k": 5},
+            {"hits": 2},
+        )
+        self.assertEqual(save_chat_message_mock.await_count, 2)
+        maybe_summarize_mock.assert_awaited_once_with(321)
+        update.message.reply_text.assert_awaited_once_with(
+            "1. score=0.880 dist=0.120 Neha handles vendor invoices.\n"
+            "2. score=0.690 dist=0.310 Accounts payable closes Friday."
+        )
+
 
 class _FakeApp:
     def __init__(self):
@@ -579,5 +613,5 @@ class BotStartupSmokeTests(unittest.TestCase):
 
         init_db_mock.assert_called_once_with()
         self.assertEqual(fake_builder.token_value, "telegram-token")
-        self.assertEqual(len(fake_app.handlers), 9)
+        self.assertEqual(len(fake_app.handlers), 10)
         fake_app.run_polling.assert_called_once()

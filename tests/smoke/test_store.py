@@ -163,3 +163,29 @@ class StoreSmokeTests(unittest.TestCase):
         sql, params = cursor.execute.call_args.args
         self.assertIn("message_embeddings", sql)
         self.assertEqual(params, ("[0.1,0.2]", 321, "[0.1,0.2]", 5))
+
+    def test_embedding_exists_checks_for_existing_row(self):
+        conn, cursor = _mock_connection(fetchone={"?column?": 1})
+
+        with patch("src.memory.store._conn", return_value=conn):
+            result = store.embedding_exists(321, 9)
+
+        self.assertTrue(result)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("message_embeddings", sql)
+        self.assertEqual(params, (321, 9))
+
+    def test_iter_chat_messages_returns_ordered_batch(self):
+        rows = [
+            {"id": 11, "chat_id": 321, "role": "user", "content": "hello"},
+            {"id": 12, "chat_id": 321, "role": "assistant", "content": "hi"},
+        ]
+        conn, cursor = _mock_connection(fetchall=rows)
+
+        with patch("src.memory.store._conn", return_value=conn):
+            result = store.iter_chat_messages(after_id=10, batch_size=2500)
+
+        self.assertEqual(result, rows)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("chat_messages", sql)
+        self.assertEqual(params, (10, 1000))
