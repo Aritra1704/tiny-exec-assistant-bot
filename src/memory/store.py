@@ -53,6 +53,14 @@ def init_db():
       role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant')),
       content TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.conversation_summaries (
+      id BIGSERIAL PRIMARY KEY,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      chat_id BIGINT NOT NULL,
+      summary_text TEXT NOT NULL,
+      last_message_id_covered BIGINT NOT NULL
+    );
     """
     with _conn() as conn:
         with conn.cursor() as cur:
@@ -131,4 +139,49 @@ def get_recent_messages(chat_id: int, limit: int = 20) -> list[dict]:
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(q, (int(chat_id), safe_limit))
+            return cur.fetchall()
+
+
+def get_last_summary(chat_id: int) -> dict | None:
+    q = f"""
+    SELECT id, created_at, chat_id, summary_text, last_message_id_covered
+    FROM {PG_SCHEMA}.conversation_summaries
+    WHERE chat_id = %s
+    ORDER BY last_message_id_covered DESC, id DESC
+    LIMIT 1;
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (int(chat_id),))
+            return cur.fetchone()
+
+
+def save_summary(chat_id: int, summary_text: str, last_message_id: int) -> int:
+    cleaned_summary = summary_text.strip()
+    if not cleaned_summary:
+        raise ValueError("Summary text cannot be empty.")
+
+    q = f"""
+    INSERT INTO {PG_SCHEMA}.conversation_summaries(chat_id, summary_text, last_message_id_covered)
+    VALUES (%s, %s, %s)
+    RETURNING id;
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (int(chat_id), cleaned_summary, int(last_message_id)))
+            summary_id = cur.fetchone()["id"]
+        conn.commit()
+    return int(summary_id)
+
+
+def get_messages_after(chat_id: int, last_message_id: int) -> list[dict]:
+    q = f"""
+    SELECT id, created_at, chat_id, role, content
+    FROM {PG_SCHEMA}.chat_messages
+    WHERE chat_id = %s AND id > %s
+    ORDER BY id ASC;
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(q, (int(chat_id), int(last_message_id)))
             return cur.fetchall()

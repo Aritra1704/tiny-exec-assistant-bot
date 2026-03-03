@@ -58,3 +58,53 @@ class StoreSmokeTests(unittest.TestCase):
     def test_save_message_rejects_invalid_role(self):
         with self.assertRaises(ValueError):
             store.save_message(321, "tool", "hello")
+
+    def test_get_last_summary_returns_latest_summary_row(self):
+        conn, cursor = _mock_connection(
+            fetchone={
+                "id": 3,
+                "chat_id": 321,
+                "summary_text": "Summary text",
+                "last_message_id_covered": 22,
+            }
+        )
+
+        with patch("src.memory.store._conn", return_value=conn):
+            result = store.get_last_summary(321)
+
+        self.assertEqual(result["summary_text"], "Summary text")
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("conversation_summaries", sql)
+        self.assertEqual(params, (321,))
+
+    def test_save_summary_inserts_summary_row(self):
+        conn, cursor = _mock_connection(fetchone={"id": 9})
+
+        with patch("src.memory.store._conn", return_value=conn):
+            summary_id = store.save_summary(321, "Concise summary", 44)
+
+        self.assertEqual(summary_id, 9)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("conversation_summaries", sql)
+        self.assertEqual(params, (321, "Concise summary", 44))
+        conn.commit.assert_called_once_with()
+
+    def test_get_messages_after_returns_ordered_rows(self):
+        rows = [
+            {
+                "id": 11,
+                "created_at": datetime(2026, 3, 3, 10, 0, tzinfo=timezone.utc),
+                "chat_id": 321,
+                "role": "assistant",
+                "content": "hello again",
+            }
+        ]
+        conn, cursor = _mock_connection(fetchall=rows)
+
+        with patch("src.memory.store._conn", return_value=conn):
+            result = store.get_messages_after(321, 10)
+
+        self.assertEqual(result, rows)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("chat_messages", sql)
+        self.assertEqual(params, (321, 10))

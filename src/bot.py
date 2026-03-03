@@ -15,7 +15,14 @@ from telegram.ext import (
 )
 
 from src.llm import chat
-from src.memory.store import get_recent_messages, init_db, log_tool, save_message
+from src.memory.store import (
+    get_last_summary,
+    get_messages_after,
+    init_db,
+    log_tool,
+    save_message,
+)
+from src.memory.summarizer import maybe_summarize
 from src.prompt import SYSTEM_PROMPT
 from src.router import decide
 from src.tools.alarms import schedule_reminder
@@ -24,6 +31,7 @@ from src.tools.notes import tool_save_note, tool_list_notes
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 CHAT_HISTORY_LIMIT = 20
+DETAILED_HISTORY_LIMIT = 15
 CHAT_CONTEXT_CHAR_LIMIT = max(200, min(int(os.getenv("CHAT_CONTEXT_CHAR_LIMIT", "1200")), 4000))
 DEBUG_TEXT_LIMIT = 80
 
@@ -79,8 +87,15 @@ def _trim_content_for_context(content: str) -> str:
     return cleaned_content[: CHAT_CONTEXT_CHAR_LIMIT - 3].rstrip() + "..."
 
 
-def _build_chat_context(history_rows: list[dict]) -> list[dict]:
+def _build_chat_context(history_rows: list[dict], summary_text: str | None = None) -> list[dict]:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if summary_text:
+        messages.append(
+            {
+                "role": "system",
+                "content": f"Conversation summary so far: {summary_text.strip()}",
+            }
+        )
     for row in history_rows:
         role = row.get("role")
         content = row.get("content")
@@ -100,14 +115,27 @@ async def _save_chat_message(chat_id: int, role: str, content: str) -> None:
         print(f"chat memory save failed for role={role}: {type(exc).__name__}")
 
 
-async def _get_chat_history(chat_id: int) -> list[dict]:
+async def _maybe_summarize(chat_id: int) -> None:
     try:
-        history_rows = await asyncio.to_thread(get_recent_messages, chat_id, CHAT_HISTORY_LIMIT)
-        print(f"Loaded {len(history_rows)} previous messages for chat_id {chat_id}")
-        return history_rows
+        await asyncio.to_thread(maybe_summarize, chat_id)
+    except Exception as exc:
+        print(f"summarization failed for chat_id {chat_id}: {type(exc).__name__}")
+
+
+async def _get_chat_history(chat_id: int) -> tuple[str | None, list[dict]]:
+    try:
+        last_summary = await asyncio.to_thread(get_last_summary, chat_id)
+        last_message_id_covered = (
+            int(last_summary["last_message_id_covered"]) if last_summary is not None else 0
+        )
+        history_rows = await asyncio.to_thread(get_messages_after, chat_id, last_message_id_covered)
+        detailed_rows = history_rows[-DETAILED_HISTORY_LIMIT:]
+        print(f"Loaded {len(detailed_rows)} previous messages for chat_id {chat_id}")
+        summary_text = str(last_summary["summary_text"]) if last_summary is not None else None
+        return summary_text, detailed_rows
     except Exception as exc:
         print(f"chat memory load failed: {type(exc).__name__}")
-        return []
+        return None, []
 
 
 def _make_send_telegram(context: ContextTypes.DEFAULT_TYPE) -> Callable[[int, str], None]:
@@ -174,6 +202,7 @@ async def _run_tool_and_reply(
     reply = _format_tool_reply(tool, result)
     await update.message.reply_text(reply)
     await _save_chat_message(chat_id, "assistant", reply)
+    await _maybe_summarize(chat_id)
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,12 +235,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _should_use_router_text(decision.get("text", "")):
         reply = decision["text"]
     else:
-        history_rows = await _get_chat_history(chat_id)
-        messages = _build_chat_context(history_rows)
+        summary_text, history_rows = await _get_chat_history(chat_id)
+        messages = _build_chat_context(history_rows, summary_text=summary_text)
         reply = await asyncio.to_thread(chat, messages)
 
     await update.message.reply_text(reply)
     await _save_chat_message(chat_id, "assistant", reply)
+    await _maybe_summarize(chat_id)
 
 
 async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -230,6 +260,7 @@ async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = _format_command_reply("save_note", result)
     await update.message.reply_text(reply)
     await _save_chat_message(chat_id, "assistant", reply)
+    await _maybe_summarize(chat_id)
 
 
 async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -256,6 +287,7 @@ async def notes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = _format_command_reply("list_notes", result)
     await update.message.reply_text(reply)
     await _save_chat_message(chat_id, "assistant", reply)
+    await _maybe_summarize(chat_id)
 
 
 async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -289,6 +321,7 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = _format_command_reply("set_reminder", result)
     await update.message.reply_text(reply)
     await _save_chat_message(chat_id, "assistant", reply)
+    await _maybe_summarize(chat_id)
 
 
 def main():
