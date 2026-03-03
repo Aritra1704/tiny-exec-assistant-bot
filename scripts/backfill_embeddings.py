@@ -1,7 +1,4 @@
 import time
-from pathlib import Path
-
-from dotenv import load_dotenv
 
 from src.embeddings import embed_text
 from src.memory.store import (
@@ -10,9 +7,6 @@ from src.memory.store import (
     iter_chat_messages,
     save_message_embedding,
 )
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env")
 
 
 def backfill_embeddings(batch_size: int = 100, sleep_seconds: float = 0.05) -> dict:

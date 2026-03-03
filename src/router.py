@@ -1,7 +1,7 @@
 import json
 from typing import Any
 
-from src.llm import chat
+from src.clients.ollama_chat import chat
 
 ALLOWED_TOOLS = {"set_reminder", "save_note", "list_notes"}
 
@@ -140,12 +140,15 @@ def _validate_tool_payload(data: Any) -> dict[str, Any] | None:
 
 
 def decide(user_text: str) -> dict[str, Any]:
-    output = chat(
-        [
-            {"role": "system", "content": TOOL_PROMPT},
-            {"role": "user", "content": user_text},
-        ]
-    ).strip()
+    try:
+        output = chat(
+            [
+                {"role": "system", "content": TOOL_PROMPT},
+                {"role": "user", "content": user_text},
+            ]
+        ).strip()
+    except RuntimeError as exc:
+        return {"type": "text", "text": str(exc), "source": "router_error"}
 
     if _looks_like_tool_call_attempt(output):
         print(f"router raw model output: {output}")

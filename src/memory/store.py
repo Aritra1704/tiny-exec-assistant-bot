@@ -1,21 +1,11 @@
-import os
 import json
-from pathlib import Path
 
-from dotenv import load_dotenv
 import psycopg
 from psycopg.rows import dict_row
-from src.embeddings import OLLAMA_EMBED_MODEL, embed_text
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
-load_dotenv(BASE_DIR / ".env")
+from src.config import get_config
+from src.embeddings import embed_text
 
-PG_HOST = os.getenv("PG_HOST", "localhost")
-PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_DATABASE = os.getenv("PG_DATABASE", "postgres")
-PG_USER = os.getenv("PG_USER", "postgres")
-PG_PASSWORD = os.getenv("PG_PASSWORD", "")
-PG_SCHEMA = os.getenv("PG_SCHEMA", "tinyse")
 ALLOWED_CHAT_ROLES = {"system", "user", "assistant"}
 DEFAULT_USER_PREFERENCES = {
     "tone": "calm",
@@ -29,15 +19,31 @@ def _vector_literal(values: list[float]) -> str:
     return "[" + ",".join(f"{float(value):.12g}" for value in values) + "]"
 
 
-def _get_embedding_dim() -> int:
+def _conn():
+    cfg = get_config(validate=True, require_telegram=False)
+    if cfg.PG_PASSWORD:
+        conninfo = (
+            f"host={cfg.PG_HOST} port={cfg.PG_PORT} dbname={cfg.PG_DATABASE} "
+            f"user={cfg.PG_USER} password={cfg.PG_PASSWORD}"
+        )
+    else:
+        conninfo = (
+            f"host={cfg.PG_HOST} port={cfg.PG_PORT} dbname={cfg.PG_DATABASE} "
+            f"user={cfg.PG_USER}"
+        )
+    return psycopg.connect(conninfo, row_factory=dict_row)
+
+
+def get_embedding_dim() -> int:
+    cfg = get_config(validate=True, require_telegram=False)
     q = f"""
     SELECT dim
-    FROM {PG_SCHEMA}.embedding_meta
+    FROM {cfg.PG_SCHEMA}.embedding_meta
     WHERE model = %s;
     """
     with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(q, (OLLAMA_EMBED_MODEL,))
+            cur.execute(q, (cfg.OLLAMA_EMBED_MODEL,))
             row = cur.fetchone()
             if row is not None:
                 return int(row["dim"])
@@ -45,40 +51,31 @@ def _get_embedding_dim() -> int:
             dim = len(embed_text("dimension check"))
             cur.execute(
                 f"""
-                INSERT INTO {PG_SCHEMA}.embedding_meta(model, dim)
+                INSERT INTO {cfg.PG_SCHEMA}.embedding_meta(model, dim)
                 VALUES (%s, %s)
                 ON CONFLICT (model) DO UPDATE SET dim = EXCLUDED.dim
                 RETURNING dim;
                 """,
-                (OLLAMA_EMBED_MODEL, dim),
+                (cfg.OLLAMA_EMBED_MODEL, dim),
             )
             stored = cur.fetchone()
         conn.commit()
     return int(stored["dim"])
 
-def _conn():
-    if PG_PASSWORD:
-        conninfo = (
-            f"host={PG_HOST} port={PG_PORT} dbname={PG_DATABASE} "
-            f"user={PG_USER} password={PG_PASSWORD}"
-        )
-    else:
-        conninfo = f"host={PG_HOST} port={PG_PORT} dbname={PG_DATABASE} user={PG_USER}"
-
-    return psycopg.connect(conninfo, row_factory=dict_row)
 
 def init_db():
+    cfg = get_config(validate=True, require_telegram=False)
     ddl = f"""
     CREATE EXTENSION IF NOT EXISTS vector;
-    CREATE SCHEMA IF NOT EXISTS {PG_SCHEMA};
+    CREATE SCHEMA IF NOT EXISTS {cfg.PG_SCHEMA};
 
-    CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.notes (
+    CREATE TABLE IF NOT EXISTS {cfg.PG_SCHEMA}.notes (
       id BIGSERIAL PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       text TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.tool_logs (
+    CREATE TABLE IF NOT EXISTS {cfg.PG_SCHEMA}.tool_logs (
       id BIGSERIAL PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       tool TEXT NOT NULL,
@@ -86,7 +83,7 @@ def init_db():
       result JSONB NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.chat_messages (
+    CREATE TABLE IF NOT EXISTS {cfg.PG_SCHEMA}.chat_messages (
       id BIGSERIAL PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       chat_id BIGINT NOT NULL,
@@ -94,7 +91,7 @@ def init_db():
       content TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.conversation_summaries (
+    CREATE TABLE IF NOT EXISTS {cfg.PG_SCHEMA}.conversation_summaries (
       id BIGSERIAL PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       chat_id BIGINT NOT NULL,
@@ -102,7 +99,7 @@ def init_db():
       last_message_id_covered BIGINT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.user_preferences (
+    CREATE TABLE IF NOT EXISTS {cfg.PG_SCHEMA}.user_preferences (
       chat_id BIGINT PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       tone TEXT DEFAULT 'calm',
@@ -111,7 +108,7 @@ def init_db():
       executive_mode BOOLEAN DEFAULT true
     );
 
-    CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.embedding_meta (
+    CREATE TABLE IF NOT EXISTS {cfg.PG_SCHEMA}.embedding_meta (
       model TEXT PRIMARY KEY,
       dim INT NOT NULL
     );
@@ -121,9 +118,9 @@ def init_db():
             cur.execute(ddl)
         conn.commit()
 
-    embedding_dim = _get_embedding_dim()
+    embedding_dim = get_embedding_dim()
     embedding_ddl = f"""
-    CREATE TABLE IF NOT EXISTS {PG_SCHEMA}.message_embeddings (
+    CREATE TABLE IF NOT EXISTS {cfg.PG_SCHEMA}.message_embeddings (
       id BIGSERIAL PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       chat_id BIGINT NOT NULL,
@@ -133,7 +130,7 @@ def init_db():
     );
 
     CREATE INDEX IF NOT EXISTS message_embeddings_chat_id_idx
-    ON {PG_SCHEMA}.message_embeddings(chat_id);
+    ON {cfg.PG_SCHEMA}.message_embeddings(chat_id);
 
     DO $$
     BEGIN
@@ -142,7 +139,7 @@ def init_db():
         FROM pg_constraint
         WHERE conname = 'message_embeddings_chat_id_message_id_key'
       ) THEN
-        ALTER TABLE {PG_SCHEMA}.message_embeddings
+        ALTER TABLE {cfg.PG_SCHEMA}.message_embeddings
         ADD CONSTRAINT message_embeddings_chat_id_message_id_key
         UNIQUE (chat_id, message_id);
       END IF;
@@ -153,8 +150,10 @@ def init_db():
             cur.execute(embedding_ddl)
         conn.commit()
 
+
 def add_note(text: str) -> int:
-    q = f"INSERT INTO {PG_SCHEMA}.notes(text) VALUES (%s) RETURNING id;"
+    cfg = get_config(validate=True, require_telegram=False)
+    q = f"INSERT INTO {cfg.PG_SCHEMA}.notes(text) VALUES (%s) RETURNING id;"
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(q, (text,))
@@ -162,10 +161,12 @@ def add_note(text: str) -> int:
         conn.commit()
         return int(note_id)
 
+
 def list_notes(limit: int = 20):
+    cfg = get_config(validate=True, require_telegram=False)
     q = f"""
     SELECT id, created_at, text
-    FROM {PG_SCHEMA}.notes
+    FROM {cfg.PG_SCHEMA}.notes
     ORDER BY id DESC
     LIMIT %s;
     """
@@ -174,12 +175,14 @@ def list_notes(limit: int = 20):
             cur.execute(q, (limit,))
             return cur.fetchall()
 
+
 def log_tool(tool: str, args_json: str, result_json: str):
+    cfg = get_config(validate=True, require_telegram=False)
     args = json.loads(args_json) if isinstance(args_json, str) else args_json
     result = json.loads(result_json) if isinstance(result_json, str) else result_json
 
     q = f"""
-    INSERT INTO {PG_SCHEMA}.tool_logs(tool, args, result)
+    INSERT INTO {cfg.PG_SCHEMA}.tool_logs(tool, args, result)
     VALUES (%s, %s::jsonb, %s::jsonb);
     """
     with _conn() as conn:
@@ -189,6 +192,7 @@ def log_tool(tool: str, args_json: str, result_json: str):
 
 
 def save_message(chat_id: int, role: str, content: str) -> int:
+    cfg = get_config(validate=True, require_telegram=False)
     cleaned_role = role.strip()
     cleaned_content = content.strip()
     if cleaned_role not in ALLOWED_CHAT_ROLES:
@@ -197,7 +201,7 @@ def save_message(chat_id: int, role: str, content: str) -> int:
         raise ValueError("Chat message content cannot be empty.")
 
     q = f"""
-    INSERT INTO {PG_SCHEMA}.chat_messages(chat_id, role, content)
+    INSERT INTO {cfg.PG_SCHEMA}.chat_messages(chat_id, role, content)
     VALUES (%s, %s, %s)
     RETURNING id;
     """
@@ -210,12 +214,13 @@ def save_message(chat_id: int, role: str, content: str) -> int:
 
 
 def get_recent_messages(chat_id: int, limit: int = 20) -> list[dict]:
+    cfg = get_config(validate=True, require_telegram=False)
     safe_limit = max(1, min(int(limit), 50))
     q = f"""
     SELECT id, created_at, chat_id, role, content
     FROM (
       SELECT id, created_at, chat_id, role, content
-      FROM {PG_SCHEMA}.chat_messages
+      FROM {cfg.PG_SCHEMA}.chat_messages
       WHERE chat_id = %s
       ORDER BY id DESC
       LIMIT %s
@@ -229,9 +234,10 @@ def get_recent_messages(chat_id: int, limit: int = 20) -> list[dict]:
 
 
 def get_last_summary(chat_id: int) -> dict | None:
+    cfg = get_config(validate=True, require_telegram=False)
     q = f"""
     SELECT id, created_at, chat_id, summary_text, last_message_id_covered
-    FROM {PG_SCHEMA}.conversation_summaries
+    FROM {cfg.PG_SCHEMA}.conversation_summaries
     WHERE chat_id = %s
     ORDER BY last_message_id_covered DESC, id DESC
     LIMIT 1;
@@ -243,12 +249,13 @@ def get_last_summary(chat_id: int) -> dict | None:
 
 
 def save_summary(chat_id: int, summary_text: str, last_message_id: int) -> int:
+    cfg = get_config(validate=True, require_telegram=False)
     cleaned_summary = summary_text.strip()
     if not cleaned_summary:
         raise ValueError("Summary text cannot be empty.")
 
     q = f"""
-    INSERT INTO {PG_SCHEMA}.conversation_summaries(chat_id, summary_text, last_message_id_covered)
+    INSERT INTO {cfg.PG_SCHEMA}.conversation_summaries(chat_id, summary_text, last_message_id_covered)
     VALUES (%s, %s, %s)
     RETURNING id;
     """
@@ -261,9 +268,10 @@ def save_summary(chat_id: int, summary_text: str, last_message_id: int) -> int:
 
 
 def get_messages_after(chat_id: int, last_message_id: int) -> list[dict]:
+    cfg = get_config(validate=True, require_telegram=False)
     q = f"""
     SELECT id, created_at, chat_id, role, content
-    FROM {PG_SCHEMA}.chat_messages
+    FROM {cfg.PG_SCHEMA}.chat_messages
     WHERE chat_id = %s AND id > %s
     ORDER BY id ASC;
     """
@@ -274,9 +282,10 @@ def get_messages_after(chat_id: int, last_message_id: int) -> list[dict]:
 
 
 def get_user_preferences(chat_id: int) -> dict:
+    cfg = get_config(validate=True, require_telegram=False)
     q = f"""
     SELECT chat_id, created_at, tone, verbosity, timezone, executive_mode
-    FROM {PG_SCHEMA}.user_preferences
+    FROM {cfg.PG_SCHEMA}.user_preferences
     WHERE chat_id = %s;
     """
     with _conn() as conn:
@@ -289,6 +298,7 @@ def get_user_preferences(chat_id: int) -> dict:
 
 
 def upsert_user_preferences(chat_id: int, fields_dict: dict) -> dict:
+    cfg = get_config(validate=True, require_telegram=False)
     allowed_fields = {"tone", "verbosity", "timezone", "executive_mode"}
     updates = {key: value for key, value in fields_dict.items() if key in allowed_fields}
     if not updates:
@@ -298,7 +308,7 @@ def upsert_user_preferences(chat_id: int, fields_dict: dict) -> dict:
     placeholders = ", ".join(["%s"] * len(updates))
     assignments = ", ".join(f"{column} = EXCLUDED.{column}" for column in updates.keys())
     q = f"""
-    INSERT INTO {PG_SCHEMA}.user_preferences(chat_id, {columns})
+    INSERT INTO {cfg.PG_SCHEMA}.user_preferences(chat_id, {columns})
     VALUES (%s, {placeholders})
     ON CONFLICT (chat_id) DO UPDATE
     SET {assignments}
@@ -319,8 +329,9 @@ def save_message_embedding(
     content: str,
     embedding: list[float],
 ) -> int:
+    cfg = get_config(validate=True, require_telegram=False)
     q = f"""
-    INSERT INTO {PG_SCHEMA}.message_embeddings(chat_id, message_id, content, embedding)
+    INSERT INTO {cfg.PG_SCHEMA}.message_embeddings(chat_id, message_id, content, embedding)
     VALUES (%s, %s, %s, %s::vector)
     ON CONFLICT (chat_id, message_id) DO UPDATE
     SET content = EXCLUDED.content,
@@ -341,11 +352,12 @@ def search_similar_messages(
     query_embedding: list[float],
     top_k: int = 5,
 ) -> list[dict]:
+    cfg = get_config(validate=True, require_telegram=False)
     safe_top_k = max(1, min(int(top_k), 20))
     vector_value = _vector_literal(query_embedding)
     q = f"""
     SELECT message_id, content, embedding <=> %s::vector AS distance
-    FROM {PG_SCHEMA}.message_embeddings
+    FROM {cfg.PG_SCHEMA}.message_embeddings
     WHERE chat_id = %s
     ORDER BY embedding <=> %s::vector
     LIMIT %s;
@@ -357,9 +369,10 @@ def search_similar_messages(
 
 
 def embedding_exists(chat_id: int, message_id: int) -> bool:
+    cfg = get_config(validate=True, require_telegram=False)
     q = f"""
     SELECT 1
-    FROM {PG_SCHEMA}.message_embeddings
+    FROM {cfg.PG_SCHEMA}.message_embeddings
     WHERE chat_id = %s AND message_id = %s
     LIMIT 1;
     """
@@ -370,10 +383,11 @@ def embedding_exists(chat_id: int, message_id: int) -> bool:
 
 
 def iter_chat_messages(after_id: int = 0, batch_size: int = 100) -> list[dict]:
+    cfg = get_config(validate=True, require_telegram=False)
     safe_batch_size = max(1, min(int(batch_size), 1000))
     q = f"""
     SELECT id, chat_id, role, content
-    FROM {PG_SCHEMA}.chat_messages
+    FROM {cfg.PG_SCHEMA}.chat_messages
     WHERE id > %s
     ORDER BY id ASC
     LIMIT %s;

@@ -4,11 +4,31 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src import bot
+from src.config import Config
 from src.prompt import SYSTEM_PROMPT
 
 
 async def _run_inline(func, *args, **kwargs):
     return func(*args, **kwargs)
+
+
+def _test_config() -> Config:
+    return Config(
+        OLLAMA_URL="http://localhost:11434",
+        OLLAMA_CHAT_MODEL="llama3.1:8b",
+        OLLAMA_EMBED_MODEL="nomic-embed-text",
+        RAG_TOP_K=5,
+        EMBED_MAX_CHARS=2000,
+        PG_HOST="localhost",
+        PG_PORT=5432,
+        PG_DATABASE="postgres",
+        PG_USER="postgres",
+        PG_PASSWORD="",
+        PG_SCHEMA="tinyse",
+        TELEGRAM_BOT_TOKEN="telegram-token",
+        LOG_LEVEL="INFO",
+        CHAT_CONTEXT_CHAR_LIMIT=1200,
+    )
 
 
 class _DummyApplication:
@@ -190,22 +210,23 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         update.message.reply_text.assert_awaited_once_with("In how many minutes?")
 
     def test_build_chat_context_includes_summary_memory_and_trims_large_messages(self):
-        long_content = "x" * (bot.CHAT_CONTEXT_CHAR_LIMIT + 25)
+        with patch("src.bot.get_config", return_value=_test_config()):
+            long_content = "x" * (_test_config().CHAT_CONTEXT_CHAR_LIMIT + 25)
 
-        messages = bot._build_chat_context(
-            [
-                {"role": "assistant", "content": "Short reply"},
-                {"role": "user", "content": long_content},
-            ],
-            summary_text="Decisions and commitments so far.",
-            preferences={
-                "tone": "casual",
-                "verbosity": "detailed",
-                "timezone": "America/New_York",
-                "executive_mode": False,
-            },
-            relevant_memory=["Discussed quarterly staffing."],
-        )
+            messages = bot._build_chat_context(
+                [
+                    {"role": "assistant", "content": "Short reply"},
+                    {"role": "user", "content": long_content},
+                ],
+                summary_text="Decisions and commitments so far.",
+                preferences={
+                    "tone": "casual",
+                    "verbosity": "detailed",
+                    "timezone": "America/New_York",
+                    "executive_mode": False,
+                },
+                relevant_memory=["Discussed quarterly staffing."],
+            )
 
         self.assertIn(SYSTEM_PROMPT, messages[0]["content"])
         self.assertIn("Tone: casual, conversational, and approachable.", messages[0]["content"])
@@ -225,7 +246,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(messages[3], {"role": "assistant", "content": "Short reply"})
-        self.assertEqual(len(messages[4]["content"]), bot.CHAT_CONTEXT_CHAR_LIMIT)
+        self.assertEqual(len(messages[4]["content"]), _test_config().CHAT_CONTEXT_CHAR_LIMIT)
         self.assertTrue(messages[4]["content"].endswith("..."))
 
     @patch("src.bot.asyncio.to_thread", new=_run_inline)
@@ -243,6 +264,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
     @patch("src.bot.asyncio.to_thread", new=_run_inline)
     async def test_get_relevant_memory_filters_current_message_and_logs_hits(self):
         with (
+            patch("src.bot.get_config", return_value=_test_config()),
             patch("src.bot.embed_text", return_value=[0.1, 0.2]),
             patch(
                 "src.bot.search_similar_messages",
@@ -263,7 +285,7 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
         )
         log_tool_mock.assert_awaited_once_with(
             "semantic_retrieval",
-            {"chat_id": 321, "top_k": bot.RAG_TOP_K},
+            {"chat_id": 321, "top_k": 5},
             {"hits": 2},
         )
 
@@ -576,6 +598,43 @@ class BotSmokeTests(unittest.IsolatedAsyncioTestCase):
             "2. score=0.690 dist=0.310 Accounts payable closes Friday."
         )
 
+    @patch("src.bot.asyncio.to_thread", new=_run_inline)
+    async def test_models_command_reports_runtime_models(self):
+        update = _DummyUpdate("/models")
+        context = _DummyContext()
+
+        with (
+            patch("src.bot.get_config", return_value=_test_config()),
+            patch("src.bot.get_embedding_dim", return_value=768),
+            patch("src.bot._save_chat_message", new=AsyncMock()) as save_chat_message_mock,
+            patch("src.bot._log_tool_result", new=AsyncMock()) as log_tool_mock,
+            patch("src.bot._maybe_summarize", new=AsyncMock()) as maybe_summarize_mock,
+        ):
+            await bot.models_command(update, context)
+
+        log_tool_mock.assert_awaited_once_with(
+            "models_info",
+            {"chat_id": 321},
+            {
+                "ok": True,
+                "chat_model": "llama3.1:8b",
+                "embed_model": "nomic-embed-text",
+                "rag_top_k": 5,
+                "embedding_dim": 768,
+                "ollama_url": "http://localhost:11434",
+            },
+        )
+        self.assertEqual(save_chat_message_mock.await_count, 2)
+        maybe_summarize_mock.assert_awaited_once_with(321)
+        update.message.reply_text.assert_awaited_once_with(
+            "Models:\n"
+            "chat=llama3.1:8b\n"
+            "embed=nomic-embed-text\n"
+            "rag_top_k=5\n"
+            "embedding_dim=768\n"
+            "ollama_url=http://localhost:11434"
+        )
+
 
 class _FakeApp:
     def __init__(self):
@@ -605,13 +664,16 @@ class BotStartupSmokeTests(unittest.TestCase):
         fake_builder = _FakeBuilder(fake_app)
 
         with (
+            patch("src.bot.get_config", return_value=_test_config()) as get_config_mock,
             patch("src.bot.init_db") as init_db_mock,
+            patch("src.bot._startup_health_check") as health_check_mock,
             patch("src.bot.ApplicationBuilder", return_value=fake_builder),
-            patch("src.bot.os.getenv", return_value="telegram-token"),
         ):
             bot.main()
 
+        get_config_mock.assert_called_once_with(validate=True)
         init_db_mock.assert_called_once_with()
+        health_check_mock.assert_called_once_with()
         self.assertEqual(fake_builder.token_value, "telegram-token")
-        self.assertEqual(len(fake_app.handlers), 10)
+        self.assertEqual(len(fake_app.handlers), 11)
         fake_app.run_polling.assert_called_once()

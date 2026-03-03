@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+from src.config import Config
 from src.memory import store
 
 
@@ -21,6 +22,31 @@ def _mock_connection(fetchone=None, fetchall=None):
 
 
 class StoreSmokeTests(unittest.TestCase):
+    def setUp(self):
+        self.config_patcher = patch(
+            "src.memory.store.get_config",
+            return_value=Config(
+                OLLAMA_URL="http://localhost:11434",
+                OLLAMA_CHAT_MODEL="llama3.1:8b",
+                OLLAMA_EMBED_MODEL="nomic-embed-text",
+                RAG_TOP_K=5,
+                EMBED_MAX_CHARS=2000,
+                PG_HOST="localhost",
+                PG_PORT=5432,
+                PG_DATABASE="postgres",
+                PG_USER="postgres",
+                PG_PASSWORD="",
+                PG_SCHEMA="tinyse",
+                TELEGRAM_BOT_TOKEN="telegram-token",
+                LOG_LEVEL="INFO",
+                CHAT_CONTEXT_CHAR_LIMIT=1200,
+            ),
+        )
+        self.config_patcher.start()
+
+    def tearDown(self):
+        self.config_patcher.stop()
+
     def test_save_message_inserts_chat_row(self):
         conn, cursor = _mock_connection(fetchone={"id": 42})
 

@@ -1,4 +1,4 @@
-from src.llm import chat
+from src.clients.ollama_chat import chat
 from src.memory.store import get_last_summary, get_messages_after, save_summary
 
 SUMMARY_TRIGGER_THRESHOLD = 30

@@ -1,10 +1,7 @@
 import asyncio
 import json
-import os
-from pathlib import Path
 from typing import Callable
 
-from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -14,9 +11,11 @@ from telegram.ext import (
     filters,
 )
 
+from src.clients.ollama_chat import chat, check_ollama_health
+from src.config import get_config
 from src.embeddings import embed_text
-from src.llm import chat
 from src.memory.store import (
+    get_embedding_dim,
     get_last_summary,
     get_messages_after,
     get_user_preferences,
@@ -33,15 +32,18 @@ from src.router import decide
 from src.tools.alarms import schedule_reminder
 from src.tools.notes import tool_save_note, tool_list_notes
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env")
-CHAT_HISTORY_LIMIT = 20
 DETAILED_HISTORY_LIMIT = 15
-CHAT_CONTEXT_CHAR_LIMIT = max(200, min(int(os.getenv("CHAT_CONTEXT_CHAR_LIMIT", "1200")), 4000))
 DEBUG_TEXT_LIMIT = 80
-RAG_TOP_K = max(1, min(int(os.getenv("RAG_TOP_K", "5")), 10))
 VALID_TONES = {"calm", "strict", "casual"}
 VALID_VERBOSITY = {"short", "medium", "detailed"}
+
+
+def _chat_context_char_limit() -> int:
+    return get_config().CHAT_CONTEXT_CHAR_LIMIT
+
+
+def _rag_top_k() -> int:
+    return get_config().RAG_TOP_K
 
 
 def _normalize_preferences(preferences: dict | None) -> dict:
@@ -138,9 +140,10 @@ def _truncate_for_debug(text: str, limit: int = DEBUG_TEXT_LIMIT) -> str:
 
 def _trim_content_for_context(content: str) -> str:
     cleaned_content = content.strip()
-    if len(cleaned_content) <= CHAT_CONTEXT_CHAR_LIMIT:
+    limit = _chat_context_char_limit()
+    if len(cleaned_content) <= limit:
         return cleaned_content
-    return cleaned_content[: CHAT_CONTEXT_CHAR_LIMIT - 3].rstrip() + "..."
+    return cleaned_content[: limit - 3].rstrip() + "..."
 
 
 def _trim_relevant_memory(content: str) -> str:
@@ -268,7 +271,7 @@ async def _get_relevant_memory(
             search_similar_messages,
             chat_id,
             query_embedding,
-            RAG_TOP_K + 3,
+            _rag_top_k() + 3,
         )
         snippets = []
         seen = set()
@@ -286,12 +289,12 @@ async def _get_relevant_memory(
 
             seen.add(dedupe_key)
             snippets.append(snippet)
-            if len(snippets) == RAG_TOP_K:
+            if len(snippets) == _rag_top_k():
                 break
 
         await _log_tool_result(
             "semantic_retrieval",
-            {"chat_id": chat_id, "top_k": RAG_TOP_K},
+            {"chat_id": chat_id, "top_k": _rag_top_k()},
             {"hits": len(snippets)},
         )
         return snippets
@@ -424,7 +427,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if _should_use_router_text(decision.get("text", "")):
+    if decision.get("source") == "router_error" or _should_use_router_text(decision.get("text", "")):
         reply = decision["text"]
     else:
         summary_text, history_rows = await _get_chat_history(chat_id)
@@ -435,7 +438,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             preferences=preferences,
             relevant_memory=relevant_memory,
         )
-        reply = await asyncio.to_thread(chat, messages)
+        try:
+            reply = await asyncio.to_thread(chat, messages)
+        except RuntimeError as exc:
+            reply = str(exc)
 
     await update.message.reply_text(reply)
     await _save_chat_message(chat_id, "assistant", reply)
@@ -683,21 +689,71 @@ async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         reply = _format_memory_hits(hits)
     except Exception as exc:
-        reply = f"Couldn’t inspect memory: {type(exc).__name__}"
+        reply = f"Couldn’t inspect memory: {exc}"
 
     await update.message.reply_text(reply)
     await _save_chat_message(chat_id, "assistant", reply)
     await _maybe_summarize(chat_id)
 
 
+async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+
+    cfg = get_config()
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    print("CMD /models args=[]")
+    await _save_chat_message(chat_id, "user", user_text)
+
+    try:
+        embedding_dim = await asyncio.to_thread(get_embedding_dim)
+    except Exception as exc:
+        embedding_dim = None
+        print(f"embedding dim lookup failed: {type(exc).__name__}")
+
+    result = {
+        "ok": True,
+        "chat_model": cfg.OLLAMA_CHAT_MODEL,
+        "embed_model": cfg.OLLAMA_EMBED_MODEL,
+        "rag_top_k": cfg.RAG_TOP_K,
+        "embedding_dim": embedding_dim,
+        "ollama_url": cfg.OLLAMA_URL,
+    }
+    await _log_tool_result("models_info", {"chat_id": chat_id}, result)
+
+    reply = (
+        "Models:\n"
+        f"chat={cfg.OLLAMA_CHAT_MODEL}\n"
+        f"embed={cfg.OLLAMA_EMBED_MODEL}\n"
+        f"rag_top_k={cfg.RAG_TOP_K}\n"
+        f"embedding_dim={embedding_dim if embedding_dim is not None else 'unknown'}\n"
+        f"ollama_url={cfg.OLLAMA_URL}"
+    )
+    await update.message.reply_text(reply)
+    await _save_chat_message(chat_id, "assistant", reply)
+    await _maybe_summarize(chat_id)
+
+
+def _startup_health_check() -> None:
+    try:
+        health_result = check_ollama_health()
+        log_tool("startup_health", {"target": "ollama_tags"}, {"ok": True, **health_result})
+        print("startup health ok")
+    except Exception as exc:
+        try:
+            log_tool("startup_health", {"target": "ollama_tags"}, {"ok": False, "error": str(exc)})
+        except Exception as log_exc:
+            print(f"startup health log failed: {type(log_exc).__name__}")
+        print(f"startup health degraded: {exc}")
+
+
 def main():
+    cfg = get_config(validate=True)
     init_db()
+    _startup_health_check()
 
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in .env")
-
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(cfg.TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("note", note_command))
     app.add_handler(CommandHandler("notes", notes_command))
     app.add_handler(CommandHandler("remind", remind_command))
@@ -707,6 +763,7 @@ def main():
     app.add_handler(CommandHandler("exec_mode", exec_mode_command))
     app.add_handler(CommandHandler("prefs", prefs_command))
     app.add_handler(CommandHandler("memory", memory_command))
+    app.add_handler(CommandHandler("models", models_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     print("tinySe is running ✅ (polling started)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
